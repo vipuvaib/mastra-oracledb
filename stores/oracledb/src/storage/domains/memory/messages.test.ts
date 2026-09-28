@@ -2,7 +2,7 @@ import type { MastraDBMessage } from '@mastra/core/memory';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { OracleTxClient } from '../../db';
-import { updateMessages } from './messages';
+import { insertMessageBatch, listMessagesById, updateMessages } from './messages';
 import type { MemoryContext } from './utils';
 
 // CR-14: updating a message's content/threadId/resourceId leaves its
@@ -113,5 +113,53 @@ describe('updateMessages semantic-recall invalidation (CR-14)', () => {
     // No vector tables were resolved (registry lookup failed with ORA-00942),
     // so no DELETE was attempted -- the update itself still succeeds.
     expect(noneCalls.some(call => call.sql.includes("JSON_VALUE(metadata, '$.message_id'"))).toBe(false);
+  });
+});
+
+describe('message content serialization', () => {
+  it('JSON-encodes string content before storing it', async () => {
+    const executeMany = vi.fn(async () => undefined);
+    const client = { executeMany } as unknown as OracleTxClient;
+    const ctx = createCtx([], client);
+    const message = createMessage({
+      id: 'msg-json-string',
+      threadId: 'thread-1',
+      content: '123' as unknown as MastraDBMessage['content'],
+    });
+
+    await insertMessageBatch(ctx, client, [message]);
+
+    const messageInsertBinds = executeMany.mock.calls[0]?.[1] as Array<{ content: string }>;
+    expect(messageInsertBinds[0]?.content).toBe(JSON.stringify('123'));
+  });
+
+  it('preserves JSON-looking strings when reading stored content', async () => {
+    const connection = {
+      execute: vi.fn(async () => ({
+        rows: [
+          {
+            id: 'msg-json-string',
+            content: JSON.stringify('123'),
+            role: 'user',
+            type: 'v2',
+            createdAt: new Date('2026-01-01T00:00:00.000Z'),
+            threadId: 'thread-1',
+            resourceId: 'resource-1',
+          },
+        ],
+      })),
+    };
+    type TestConnection = typeof connection;
+    const ctx = {
+      db: {
+        withConnection: vi.fn(async (callback: (connection: TestConnection) => Promise<unknown>) =>
+          callback(connection),
+        ),
+      },
+    } as unknown as MemoryContext;
+
+    const result = await listMessagesById(ctx, { messageIds: ['msg-json-string'] });
+
+    expect(result.messages[0]?.content.parts[0]).toMatchObject({ type: 'text', text: '123' });
   });
 });

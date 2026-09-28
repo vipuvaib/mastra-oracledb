@@ -247,11 +247,7 @@ async function relaxObservationalMemoryNullability(ctx: MemoryContext, connectio
 async function createIndexes(ctx: MemoryContext, connection: Connection): Promise<void> {
   if (!ctx.skipDefaultIndexes) {
     for (const index of defaultIndexes(ctx)) {
-      try {
-        await createOracleIndex(connection, index, ctx.schemaName);
-      } catch (error) {
-        ctx.logger?.warn?.(`Failed to create Oracle default index ${index.name}:`, error);
-      }
+      await createOracleIndex(connection, index, ctx.schemaName);
     }
   }
 

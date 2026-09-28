@@ -61,6 +61,25 @@ const { messages } = await memory.listMessages({ threadId: 'thread-123' });
 - [Oracle Database integration guide](https://mastra.ai/integrations/databases/oracledb)
 - [Oracle Database vector reference](https://mastra.ai/reference/vectors/oracledb)
 
+### Vector memory (HNSW only)
+
+Exact search is the default, and IVF indexes do not require Oracle's Vector Pool. HNSW indexes do require
+`VECTOR_MEMORY_SIZE` to be configured before they are built.
+
+For the Oracle Free Docker setup, run the initialization script at the CDB root as `SYS`, then restart the
+database after the container finishes initializing:
+
+```bash
+docker compose up -d --wait
+docker compose restart db
+```
+
+The script is [configure-vector-memory.sql](https://github.com/mastra-ai/mastra/blob/main/stores/oracledb/scripts/configure-vector-memory.sql)
+and uses `SCOPE=SPFILE`, so the restart is required. `vector.configureVectorMemory()` runs a privileged
+`ALTER SYSTEM` operation on its current connection (`MEMORY` by default); it does not switch to the CDB root,
+grant privileges, or restart the database. Use it only when the target Oracle deployment supports the requested
+scope through that connection.
+
 ## Changelog
 
 See the [package changelog](https://github.com/mastra-ai/mastra/blob/main/stores/oracledb/CHANGELOG.md) for version history and release notes.

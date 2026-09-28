@@ -720,16 +720,18 @@ function messageOrderColumn(field: string): string {
 }
 
 function serializeContent(content: MastraDBMessage['content']): string {
-  return typeof content === 'string' ? content : JSON.stringify(content);
+  const serialized = JSON.stringify(content);
+  if (serialized === undefined) {
+    throw new Error('Message content must be JSON-serializable');
+  }
+  return serialized;
 }
 
 function parseContent(value: unknown): MastraDBMessage['content'] {
   if (typeof value !== 'string') return value as MastraDBMessage['content'];
-  try {
-    return JSON.parse(value) as MastraDBMessage['content'];
-  } catch {
-    return value as unknown as MastraDBMessage['content'];
-  }
+  // Message content is always stored as one JSON document, so JSON-looking
+  // string values remain strings after a database round trip.
+  return JSON.parse(value) as MastraDBMessage['content'];
 }
 
 function mergeMessageContent(

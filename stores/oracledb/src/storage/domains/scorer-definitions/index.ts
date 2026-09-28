@@ -566,20 +566,12 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
     await this.db.withConnection(async connection => {
       if (!this.skipDefaultIndexes) {
         for (const index of this.getDefaultIndexDefinitions()) {
-          try {
-            await createOracleIndex(connection, index, this.schemaName);
-          } catch (error) {
-            this.logger?.warn?.(`Failed to create Oracle default index ${index.name}:`, error);
-          }
+          await createOracleIndex(connection, index, this.schemaName);
         }
       }
 
       for (const index of this.indexes) {
-        try {
-          await createOracleIndex(connection, index, this.schemaName);
-        } catch (error) {
-          this.logger?.warn?.(`Failed to create Oracle custom index ${index.name}:`, error);
-        }
+        await createOracleIndex(connection, index, this.schemaName);
       }
     });
   }

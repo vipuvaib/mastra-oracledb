@@ -301,11 +301,7 @@ export class WorkflowsOracle extends WorkflowsStorage {
     await this.db.withConnection(async connection => {
       if (!this.skipDefaultIndexes) {
         for (const index of this.defaultIndexes()) {
-          try {
-            await createOracleIndex(connection, index, this.schemaName);
-          } catch (error) {
-            this.logger?.warn?.(`Failed to create Oracle default index ${index.name}:`, error);
-          }
+          await createOracleIndex(connection, index, this.schemaName);
         }
       }
 

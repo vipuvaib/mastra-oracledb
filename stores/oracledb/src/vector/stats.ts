@@ -136,7 +136,8 @@ export async function configureVectorMemory(
   const normalizedScope = normalizeVectorMemoryScope(scope);
 
   return withConnection(async connection => {
-    // HNSW uses Oracle's Vector Pool; local/dev users can size it through this privileged helper.
+    // HNSW uses Oracle's Vector Pool. This is a privileged ALTER SYSTEM operation on the current connection;
+    // it does not switch to the CDB root or restart the database for the caller.
     await connection.execute(`ALTER SYSTEM SET VECTOR_MEMORY_SIZE = ${normalizedSize} SCOPE=${normalizedScope}`);
   }).catch(error => {
     if (error instanceof MastraError) throw error;
@@ -187,7 +188,9 @@ function createVectorMemoryConfigurationError(size: string, scope: string, cause
   return withCause(
     new Error(
       `Unable to set Oracle VECTOR_MEMORY_SIZE=${size} SCOPE=${scope}. ` +
-        'Run this with a DBA-capable user such as SYSTEM for local Docker databases, or ask your DBA to size the Vector Pool before building HNSW indexes.',
+        'This is a privileged ALTER SYSTEM operation, and the current connection must be allowed to run it at the requested scope. ' +
+        'For Oracle Free Docker, configure it as SYS at the CDB root with SCOPE=SPFILE using the Mastra initialization script ' +
+        '(stores/oracledb/scripts/configure-vector-memory.sql), then restart the database before building HNSW.',
     ),
     cause,
   );

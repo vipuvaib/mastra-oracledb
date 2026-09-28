@@ -172,8 +172,17 @@ export class IndexRegistry {
                 await this.updateRegistryIndexConfig(connection, logicalIndexName, normalizedMetric, mergedConfig);
               }
             }
-            const finalInfo =
-              buildIndex && mergedConfig.type !== 'none'
+            const finalInfo = !tableExists
+              ? {
+                  indexName: logicalIndexName,
+                  tableName,
+                  dimension,
+                  metric: normalizedMetric,
+                  indexType: builtConfig.type,
+                  vectorFormat: normalizedFormat,
+                  accuracy: builtConfig.accuracy ?? 95,
+                }
+              : buildIndex && mergedConfig.type !== 'none'
                 ? {
                     ...existing,
                     tableName,
@@ -181,17 +190,7 @@ export class IndexRegistry {
                     indexType: mergedConfig.type,
                     accuracy: mergedConfig.accuracy ?? 95,
                   }
-                : tableExists
-                  ? { ...existing, tableName }
-                  : {
-                      indexName: logicalIndexName,
-                      tableName,
-                      dimension,
-                      metric: normalizedMetric,
-                      indexType: builtConfig.type,
-                      vectorFormat: normalizedFormat,
-                      accuracy: builtConfig.accuracy ?? 95,
-                    };
+                : { ...existing, tableName };
             this.cacheIndexMetadata(logicalIndexName, {
               ...finalInfo,
               qualifiedTableName: qualifyName(tableName, this.schemaName),
@@ -889,8 +888,8 @@ function createInsufficientVectorMemoryError(
     new Error(
       `Oracle could not create the ${indexType} vector index "${indexName}" because the current container's Vector Pool is out of space (ORA-51962). ` +
         'HNSW indexes live in the Oracle Vector Pool, controlled by VECTOR_MEMORY_SIZE. ' +
-        'Increase it once with DBA privileges, for example: ALTER SYSTEM SET VECTOR_MEMORY_SIZE = 512M SCOPE=MEMORY. ' +
-        'From this adapter you can also run vector.configureVectorMemory({ size: "512M" }) using a privileged connection. ',
+        'For Oracle Free Docker, run the Mastra initialization script (stores/oracledb/scripts/configure-vector-memory.sql) as SYS at the CDB root; it uses SCOPE=SPFILE, so restart the database before retrying. ' +
+        'The vector.configureVectorMemory({ size: "512M" }) helper runs a privileged ALTER SYSTEM operation on the current connection and does not replace the required container, privilege, or restart setup. ',
     ),
     cause,
   );

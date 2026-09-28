@@ -202,7 +202,7 @@ describe('OracleVector vector memory support', () => {
 
     await expect(
       (vector as any).createVectorIndex(connection, 'memory_messages', 'cosine', { type: 'hnsw' }),
-    ).rejects.toThrow(/VECTOR_MEMORY_SIZE|Vector Pool|ORA-51962/i);
+    ).rejects.toThrow(/Oracle Free Docker|CDB root|SPFILE|restart/i);
   });
 
   it('keeps createIndex retryable when an HNSW build exhausts the Vector Pool', async () => {
@@ -788,6 +788,46 @@ describe('OracleVector operation branches', () => {
     expect(sql).toContain('CREATE VECTOR INDEX "MASTRA_VEC_MISSING_TABLE_INDEX_VECTOR_IDX"');
     expect(sql).toContain('DROP INDEX "MASTRA_VEC_MISSING_TABLE_INDEX_VECTOR_IDX"');
     expect(sql).toContain('UPDATE "MASTRA_VECTOR_INDEXES"');
+  });
+
+  it('refreshes cached shape metadata when recreating a missing table', async () => {
+    const registryRow = {
+      indexName: 'recreated_shape_index',
+      tableName: 'MASTRA_VEC_RECREATED_SHAPE_INDEX',
+      dimension: 3,
+      metric: 'cosine',
+      indexType: 'none',
+      vectorFormat: 'vector',
+      accuracy: 95,
+    };
+    const connection = {
+      execute: vi.fn(async (sql: string) => {
+        if (sql.includes('FROM all_tables')) return { rows: [] };
+        if (sql.includes('index_name AS "indexName"') && sql.includes('table_name AS "tableName"')) {
+          return { rows: [registryRow] };
+        }
+        return { rows: [], rowsAffected: 1 };
+      }),
+      commit: vi.fn(async () => undefined),
+      rollback: vi.fn(async () => undefined),
+    };
+    const { vector } = createVectorWithConnection(connection);
+
+    await vector.createIndex({
+      indexName: 'recreated_shape_index',
+      dimension: 8,
+      metric: 'hamming',
+      vectorFormat: 'bit',
+      indexConfig: { type: 'ivf', accuracy: 88 },
+    });
+
+    await expect(vector.describeIndex({ indexName: 'recreated_shape_index' })).resolves.toMatchObject({
+      dimension: 8,
+      metric: 'hamming',
+      vectorFormat: 'bit',
+      indexType: 'ivf',
+      accuracy: 88,
+    });
   });
 
   it('serializes concurrent buildIndex calls for the same index name instead of interleaving DDL', async () => {

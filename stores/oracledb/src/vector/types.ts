@@ -24,7 +24,9 @@ export interface OracleVectorIndexConfig {
   };
 }
 
-// Optional DBA/setup helper for local or self-managed databases that need Vector Pool memory before HNSW builds.
+// Privileged ALTER SYSTEM helper for deployments that allow VECTOR_MEMORY_SIZE to be changed through the current
+// connection. It does not switch containers, grant privileges, or restart the database; Oracle Free Docker users
+// should use scripts/configure-vector-memory.sql at the CDB root instead.
 export interface OracleVectorMemoryConfig {
   size: string;
   scope?: OracleVectorMemoryScope;
