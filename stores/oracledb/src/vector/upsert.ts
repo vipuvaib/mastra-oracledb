@@ -14,6 +14,7 @@ import oracledb from 'oracledb';
 import { asBindParameters, jsonBind, jsonBindText, rollbackQuietly } from '../shared/connection';
 import type { IndexRegistry, WithConnection } from './ddl';
 import { buildMetadataWhereClause } from './filter';
+import type { SqlFragment } from './filter';
 import type { OracleIndexStats, OracleVectorFilter, OracleVectorFormat } from './types';
 
 export const VECTOR_ID_DELETE_CHUNK_SIZE = 900;
@@ -27,6 +28,18 @@ export const DEFAULT_VECTOR_UPSERT_BATCH_SIZE = 200;
 export const STORE_NAME = 'ORACLE';
 
 type BindParameters = oracledb.BindParameters;
+
+function assertDestructiveFilterIsRestricted(filter: SqlFragment, operation: string, indexName: string): void {
+  if (filter.match !== 'match-all') return;
+
+  throw new MastraError({
+    id: createVectorErrorId(STORE_NAME, operation, 'UNSAFE_FILTER'),
+    text: 'Refusing a destructive vector operation with a match-all filter',
+    domain: ErrorDomain.MASTRA_VECTOR,
+    category: ErrorCategory.USER,
+    details: { indexName },
+  });
+}
 
 export async function upsert(
   registry: IndexRegistry,
@@ -54,6 +67,7 @@ export async function upsert(
       // deleteFilter + upsert is treated as one transaction to avoid partially refreshed indexes.
       if (deleteFilter && Object.keys(deleteFilter).length > 0) {
         const filter = buildMetadataWhereClause(deleteFilter);
+        assertDestructiveFilterIsRestricted(filter, 'UPSERT', indexName);
         await connection.execute(
           `DELETE FROM ${indexInfo.qualifiedTableName} ${filter.sql}`,
           asBindParameters(filter.binds),
@@ -163,7 +177,9 @@ export async function updateVector(
       binds.metadata = jsonBind(update.metadata);
     }
 
-    const where = id ? { sql: 'WHERE vector_id = :id', binds: { id } } : buildMetadataWhereClause(filter);
+    const where = id
+      ? { sql: 'WHERE vector_id = :id', binds: { id }, match: 'filtered' as const }
+      : buildMetadataWhereClause(filter);
     if (!where.sql) {
       throw asMastraError(
         'UPDATE_VECTOR',
@@ -173,6 +189,8 @@ export async function updateVector(
         ErrorCategory.USER,
       );
     }
+
+    if (!id) assertDestructiveFilterIsRestricted(where, 'UPDATE_VECTOR', indexName);
 
     try {
       await connection.execute(
@@ -256,6 +274,7 @@ export async function deleteVectors(
         }
       } else {
         const metadataFilter = buildMetadataWhereClause(filter);
+        assertDestructiveFilterIsRestricted(metadataFilter, 'DELETE_VECTORS', indexName);
         await connection.execute(
           `DELETE FROM ${indexInfo.qualifiedTableName} ${metadataFilter.sql}`,
           asBindParameters(metadataFilter.binds),

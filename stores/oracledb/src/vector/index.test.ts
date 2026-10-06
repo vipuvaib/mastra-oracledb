@@ -502,6 +502,43 @@ describe('OracleVector hot path SQL shape', () => {
 });
 
 describe('OracleVector operation branches', () => {
+  it('rejects destructive operations with match-all filters before executing them', async () => {
+    const connection = {
+      execute: vi.fn(async () => ({ rows: [], rowsAffected: 1 })),
+      executeMany: vi.fn(async () => ({ rowsAffected: 1 })),
+      commit: vi.fn(async () => undefined),
+      rollback: vi.fn(async () => undefined),
+    };
+    const { vector } = createVectorWithConnection(connection);
+    cacheIndex(vector);
+
+    await expect(
+      vector.upsert({
+        indexName: 'hot_index',
+        vectors: [[1, 2, 3]],
+        deleteFilter: { $and: [] },
+      }),
+    ).rejects.toThrow(/match-all filter/i);
+    await expect(
+      vector.updateVector({
+        indexName: 'hot_index',
+        filter: { $and: [] },
+        update: { metadata: { tag: 'new' } },
+      }),
+    ).rejects.toThrow(/match-all filter/i);
+    await expect(
+      vector.deleteVectors({
+        indexName: 'hot_index',
+        filter: { $nor: [] },
+      }),
+    ).rejects.toThrow(/match-all filter/i);
+
+    expect(connection.execute).not.toHaveBeenCalled();
+    expect(connection.executeMany).not.toHaveBeenCalled();
+    expect(connection.rollback).toHaveBeenCalledTimes(2);
+    expect(connection.commit).not.toHaveBeenCalled();
+  });
+
   it('handles upsert, metadata-only query, min-score query, update, delete, and bit vector conversion', async () => {
     const connection = {
       execute: vi.fn(async (sql: string) => {

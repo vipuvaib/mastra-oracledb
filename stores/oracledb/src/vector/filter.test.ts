@@ -5,8 +5,26 @@ import { buildMetadataWhereClause } from './filter';
 // Filter tests assert SQL shape and bind behavior without depending on a live Oracle connection.
 describe('buildMetadataWhereClause', () => {
   it('returns an empty clause for missing or empty filters', () => {
-    expect(buildMetadataWhereClause()).toEqual({ sql: '', binds: {} });
-    expect(buildMetadataWhereClause({})).toEqual({ sql: '', binds: {} });
+    expect(buildMetadataWhereClause()).toEqual({ sql: '', binds: {}, match: 'match-all' });
+    expect(buildMetadataWhereClause({})).toEqual({ sql: '', binds: {}, match: 'match-all' });
+  });
+
+  it('classifies filters that match all, match none, or have a predicate', () => {
+    expect(buildMetadataWhereClause({ $and: [] }).match).toBe('match-all');
+    expect(buildMetadataWhereClause({ $nor: [] }).match).toBe('match-all');
+    expect(buildMetadataWhereClause({ kind: { $nin: [] } }).match).toBe('match-all');
+    expect(buildMetadataWhereClause({ kind: { $all: [] } }).match).toBe('match-all');
+    expect(buildMetadataWhereClause({ tags: { $contains: [] } }).match).toBe('match-all');
+
+    expect(buildMetadataWhereClause({ $or: [] }).match).toBe('match-none');
+    expect(buildMetadataWhereClause({ kind: { $in: [] } }).match).toBe('match-none');
+    expect(buildMetadataWhereClause({ kind: 'oracle' }).match).toBe('filtered');
+  });
+
+  it('combines constant filter classifications using logical semantics', () => {
+    expect(buildMetadataWhereClause({ $and: [{ $or: [] }, { kind: 'oracle' }] }).match).toBe('match-none');
+    expect(buildMetadataWhereClause({ $or: [{ $and: [] }, { kind: 'oracle' }] }).match).toBe('match-all');
+    expect(buildMetadataWhereClause({ $not: { $and: [] } }).match).toBe('match-none');
   });
 
   it('builds equality filters over Oracle JSON metadata', () => {

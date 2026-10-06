@@ -2,9 +2,12 @@ import { assertJsonPath, jsonPathForPredicatePrefix } from './identifiers';
 import type { OracleVectorFilter } from './types';
 
 // Filter compilation returns SQL plus binds so callers never interpolate user metadata values.
+export type FilterMatch = 'filtered' | 'match-all' | 'match-none';
+
 export interface SqlFragment {
   sql: string;
   binds: Record<string, unknown>;
+  match: FilterMatch;
 }
 
 // Bind names are generated locally to keep nested logical operators composable.
@@ -22,12 +25,89 @@ class BindCollector {
 // Converts Mastra metadata filters into Oracle JSON_VALUE/JSON_EXISTS predicates.
 export function buildMetadataWhereClause(filter?: OracleVectorFilter): SqlFragment {
   if (!filter || Object.keys(filter).length === 0) {
-    return { sql: '', binds: {} };
+    return { sql: '', binds: {}, match: 'match-all' };
   }
 
   const collector = new BindCollector();
   const sql = buildNode(filter, collector);
-  return { sql: sql ? `WHERE ${sql}` : '', binds: collector.binds };
+  return { sql: sql ? `WHERE ${sql}` : '', binds: collector.binds, match: classifyNode(filter) };
+}
+
+function classifyNode(node: unknown): FilterMatch {
+  const matches: FilterMatch[] = [];
+  for (const [key, value] of Object.entries(assertPlainObject(node, 'filter'))) {
+    if (key === '$and') matches.push(combineMatches(asFilterList(value, key).map(classifyNode), 'and'));
+    else if (key === '$or') matches.push(combineMatches(asFilterList(value, key).map(classifyNode), 'or'));
+    else if (key === '$nor')
+      matches.push(invertMatch(combineMatches(asFilterList(value, key).map(classifyNode), 'or')));
+    else if (key === '$not') matches.push(invertMatch(classifyNode(assertPlainObject(value, '$not'))));
+    else matches.push(classifyField(value));
+  }
+  return combineMatches(matches, 'and');
+}
+
+function classifyField(value: unknown): FilterMatch {
+  if (Array.isArray(value)) return value.length === 0 ? 'match-none' : 'filtered';
+  if (!isPlainObject(value)) return 'filtered';
+  const entries = Object.entries(value);
+  const operators = entries.filter(([key]) => key.startsWith('$'));
+  if (operators.length === 0)
+    return combineMatches(
+      entries.map(([, nested]) => classifyField(nested)),
+      'and',
+    );
+  return combineMatches(
+    operators.map(([operator, operand]) => classifyOperator(operator, operand)),
+    'and',
+  );
+}
+
+function classifyOperator(operator: string, value: unknown): FilterMatch {
+  switch (operator) {
+    case '$in':
+      return (Array.isArray(value) ? value : [value]).length === 0 ? 'match-none' : 'filtered';
+    case '$nin':
+    case '$all':
+      return (Array.isArray(value) ? value : [value]).length === 0 ? 'match-all' : 'filtered';
+    case '$contains':
+      return Array.isArray(value) && value.length === 0 ? 'match-all' : 'filtered';
+    case '$not': {
+      const nested = assertPlainObject(value, '$not');
+      const matches = Object.entries(nested).map(([key, operand]) =>
+        key.startsWith('$') ? classifyOperator(key, operand) : classifyField(operand),
+      );
+      return invertMatch(combineMatches(matches, 'and'));
+    }
+    case '$elemMatch': {
+      const nested = assertPlainObject(value, '$elemMatch');
+      const matches = Object.entries(nested).map(([key, operand]) => {
+        if (key.startsWith('$')) return classifyOperator(key, operand);
+        return isPlainObject(operand) ? classifyField(operand) : 'filtered';
+      });
+      return combineMatches(matches, 'and') === 'match-none' ? 'match-none' : 'filtered';
+    }
+    default:
+      return 'filtered';
+  }
+}
+
+function combineMatches(matches: FilterMatch[], operator: 'and' | 'or'): FilterMatch {
+  if (operator === 'and') {
+    if (matches.includes('match-none')) return 'match-none';
+    if (matches.every(match => match === 'match-all')) return 'match-all';
+    return 'filtered';
+  }
+  if (matches.includes('match-all')) return 'match-all';
+  if (matches.every(match => match === 'match-none')) return 'match-none';
+  return 'filtered';
+}
+
+function invertMatch(match: FilterMatch): FilterMatch {
+  return match === 'match-all' ? 'match-none' : match === 'match-none' ? 'match-all' : 'filtered';
+}
+
+function asFilterList(value: unknown, operator: string): unknown[] {
+  return Array.isArray(value) ? value : [assertPlainObject(value, operator)];
 }
 
 function buildNode(node: unknown, collector: BindCollector): string {
