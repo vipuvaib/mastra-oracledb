@@ -46,6 +46,12 @@ export async function updateBufferedObservations(
     await ctx.db.tx(async (_client, connection) => {
       const row = await lockOMRow(ctx, connection, input.id, 'UPDATE_BUFFERED_OBSERVATIONS');
       const existingChunks = parseBufferedChunks(row.bufferedObservationChunks);
+      // Persistence may be retried after a successful commit. Preserve the first
+      // chunk for this cycle while it remains buffered.
+      if (existingChunks.some(chunk => chunk.cycleId === input.chunk.cycleId)) {
+        return;
+      }
+
       // Buffer chunks let long observation cycles append safely without
       // rewriting the active observation CLOB on every small update.
       const newChunk: BufferedObservationChunk = {
