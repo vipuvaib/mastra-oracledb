@@ -99,13 +99,23 @@ export async function swapBufferedToActive(
   try {
     return await ctx.db.tx(async (_client, connection) => {
       const row = await lockOMRow(ctx, connection, input.id, 'SWAP_BUFFERED_TO_ACTIVE');
-      const chunks = input.bufferedChunks?.length
-        ? input.bufferedChunks
-        : parseBufferedChunks(row.bufferedObservationChunks);
+      const lockedChunks = parseBufferedChunks(row.bufferedObservationChunks);
 
-      if (chunks.length === 0) {
+      if (lockedChunks.length === 0) {
         return emptySwapResult();
       }
+
+      // The locked row defines buffer membership and order. The caller may have
+      // refreshed token weights from a newer message snapshot, but its chunk list
+      // can be stale if a buffer append or another activation completed before we
+      // acquired this lock. Apply only those weights to chunks still in the row.
+      const refreshedMessageTokens = new Map<string, number>(
+        (input.bufferedChunks ?? []).map(chunk => [chunk.id, chunk.messageTokens] as const),
+      );
+      const chunks = lockedChunks.map(chunk => {
+        const messageTokens = refreshedMessageTokens.get(chunk.id);
+        return messageTokens === undefined ? chunk : { ...chunk, messageTokens };
+      });
 
       const activation = calculateBufferedActivation(chunks, input);
       const lastObservedAt =
