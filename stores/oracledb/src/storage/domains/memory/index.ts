@@ -170,10 +170,26 @@ export class MemoryOracle extends MemoryStorage {
     return updateThread(this.ctx, args);
   }
 
+  /**
+   * Deletes the thread, its messages, and matching vectors from discoverable
+   * Oracle semantic-recall tables in one database transaction.
+   *
+   * Does not clear thread-scoped observational memory or coordinate cleanup in
+   * other vector stores. Use Memory.deleteThread() for the higher-level workflow.
+   * Direct callers must clear associated thread-scoped observational memory and
+   * manage any additional vector cleanup.
+   */
   async deleteThread(args: { threadId: string }): Promise<void> {
     return deleteThread(this.ctx, args);
   }
 
+  /**
+   * Updates the resourceId of the thread and its messages in one database transaction.
+   *
+   * Does not migrate semantic-recall vectors. Use Memory.updateThreadResourceId()
+   * to coordinate message-vector migration when a vector store, embedder, and
+   * semantic recall are configured. Direct callers must manage vector migration.
+   */
   async updateThreadResourceId(args: { threadId: string; resourceId: string }): Promise<StorageThreadType> {
     return updateThreadResourceId(this.ctx, args);
   }

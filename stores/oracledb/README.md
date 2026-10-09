@@ -56,6 +56,49 @@ const savedThread = await memory.getThreadById({ threadId: 'thread-123' });
 const { messages } = await memory.listMessages({ threadId: 'thread-123' });
 ```
 
+### Memory lifecycle responsibilities
+
+The `memory` object returned by `store.getStore('memory')` above is the low-level storage adapter,
+not the higher-level `Memory` class from `@mastra/memory`. Its methods don't coordinate every
+part of the memory lifecycle across storage and vector stores.
+
+#### Resource transfer
+
+The storage adapter's `updateThreadResourceId({ threadId, resourceId })` updates the thread and
+its messages in one Oracle transaction. It doesn't update vector metadata or re-embed messages.
+Direct storage callers must manage any required vector migration.
+
+Use `Memory.updateThreadResourceId()` to coordinate storage transfer with semantic-recall message
+vector migration. When a vector store, embedder, and semantic recall are configured, this method
+deletes the thread's existing message vectors and re-embeds its messages under the new resource.
+This doesn't migrate all derived memory, such as observational-memory records or observation vectors.
+
+Storage transfer commits before vector migration. If migration fails, the higher-level method
+throws, but the storage transfer remains committed. Retrying the higher-level method with the
+same target resource retries the migration when the required vector configuration is present.
+Storage and vector migration aren't one atomic transaction.
+
+#### Thread deletion
+
+The storage adapter's `deleteThread({ threadId })` deletes the thread, its messages, and matching
+vector rows from discoverable Oracle semantic-recall tables in one transaction. Vector cleanup
+uses the configured Oracle registry and recognized memory-message index names; it doesn't cover
+arbitrary indexes or a separately configured vector store. The method doesn't delete thread-scoped
+observational-memory records.
+
+Use `Memory.deleteThread(threadId)` for the higher-level cleanup workflow. It clears thread-scoped
+observational memory when the thread's resource ID is available and the adapter supports it, and
+starts background cleanup of message and observation vectors in the configured vector store.
+Call `await memory.settled()` on the higher-level `Memory` instance to wait for background cleanup
+attempts before closing storage connections. Vector-cleanup failures are logged, so completion
+doesn't guarantee that every vector was deleted.
+
+If you delete threads directly through the storage adapter, capture the thread's resource ID before
+deletion and explicitly call `clearObservationalMemory(threadId, resourceId)` for its thread-scoped
+record. Coordinate any in-flight memory writes and additional vector cleanup yourself. Otherwise,
+stale observations can survive thread-ID reuse. Don't clear shared resource-scoped observational
+memory as part of deleting a single thread.
+
 ## Documentation
 
 - [Oracle Database integration guide](https://mastra.ai/integrations/databases/oracledb)
