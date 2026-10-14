@@ -1,8 +1,11 @@
-import { beforeAll, describe, expect, it } from 'vitest';
+import { randomUUID } from 'node:crypto';
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createVectorTestSuite } from '../../../_test-utils/src';
 import { OracleStore } from '../storage';
 import { tableNameForIndex } from './identifiers';
+import type { OracleVectorFilter } from './types';
 import { OracleVector } from '.';
 
 // Oracle integration coverage stays opt-in because it requires a reachable database and credentials.
@@ -40,6 +43,939 @@ if (runIntegration) {
     supportsZeroVectors: false,
   });
 }
+
+// Assert database results rather than SQL shape: JSON_VALUE returns SQL NULL for arrays,
+// so combining scalar NOT IN with array exclusion using AND can hide valid matches.
+describeIntegration('OracleVector $nin compatibility', () => {
+  const fixtures: { id: string; metadata: Record<string, unknown> }[] = [
+    { id: 'text-array-allowed', metadata: { cohort: 'text', tags: ['allowed', 'other'] } },
+    { id: 'text-array-mixed', metadata: { cohort: 'text', tags: ['blocked', 'allowed'] } },
+    { id: 'text-array-blocked', metadata: { cohort: 'text', tags: ['blocked'] } },
+    { id: 'text-array-empty', metadata: { cohort: 'text', tags: [] } },
+    { id: 'text-array-null', metadata: { cohort: 'text', tags: [null, 'allowed'] } },
+    { id: 'text-scalar-allowed', metadata: { cohort: 'text', tags: 'allowed' } },
+    { id: 'text-scalar-blocked', metadata: { cohort: 'text', tags: 'blocked' } },
+    { id: 'text-null', metadata: { cohort: 'text', tags: null } },
+    { id: 'text-missing', metadata: { cohort: 'text' } },
+    { id: 'number-array-allowed', metadata: { cohort: 'number', tags: [2, 3] } },
+    { id: 'number-array-mixed', metadata: { cohort: 'number', tags: [1, 2] } },
+    { id: 'number-array-empty', metadata: { cohort: 'number', tags: [] } },
+    { id: 'number-scalar-allowed', metadata: { cohort: 'number', tags: 2 } },
+    { id: 'number-scalar-blocked', metadata: { cohort: 'number', tags: 1 } },
+    { id: 'number-null', metadata: { cohort: 'number', tags: null } },
+    { id: 'number-missing', metadata: { cohort: 'number' } },
+    { id: 'mixed-array-allowed', metadata: { cohort: 'mixed', tags: ['allowed', 2] } },
+    { id: 'mixed-array-blocked-string', metadata: { cohort: 'mixed', tags: ['blocked', 2] } },
+    { id: 'mixed-array-blocked-number', metadata: { cohort: 'mixed', tags: ['allowed', 1] } },
+    { id: 'mixed-array-blocked-both', metadata: { cohort: 'mixed', tags: ['blocked', 1] } },
+    { id: 'mixed-array-empty', metadata: { cohort: 'mixed', tags: [] } },
+    { id: 'absent-null', metadata: { cohort: 'absent', tags: null } },
+    { id: 'absent-missing', metadata: { cohort: 'absent' } },
+  ];
+
+  // Reuse the same values at a nested path to check path handling independently of membership.
+  const metadata = fixtures.map(fixture => ({
+    ...fixture.metadata,
+    profile: Object.hasOwn(fixture.metadata, 'tags') ? { tags: fixture.metadata.tags } : {},
+  }));
+  const cases: { name: string; filter: OracleVectorFilter; expectedIds: string[] }[] = [
+    {
+      name: 'matches allowed string arrays, empty arrays, and scalars while excluding any blocked element',
+      filter: { cohort: 'text', tags: { $nin: ['blocked'] } },
+      expectedIds: ['text-array-allowed', 'text-array-empty', 'text-array-null', 'text-scalar-allowed'],
+    },
+    {
+      name: 'checks every excluded value against every array element',
+      filter: { cohort: 'text', tags: { $nin: ['blocked', 'other'] } },
+      expectedIds: ['text-array-empty', 'text-array-null', 'text-scalar-allowed'],
+    },
+    {
+      name: 'matches allowed numeric arrays, empty arrays, and scalars',
+      filter: { cohort: 'number', tags: { $nin: [1] } },
+      expectedIds: ['number-array-allowed', 'number-array-empty', 'number-scalar-allowed'],
+    },
+    {
+      name: 'supports mixed exclusion values with a string first',
+      filter: { cohort: 'mixed', tags: { $nin: ['blocked', 1] } },
+      expectedIds: ['mixed-array-allowed', 'mixed-array-empty'],
+    },
+    {
+      name: 'supports mixed exclusion values with a number first',
+      filter: { cohort: 'mixed', tags: { $nin: [1, 'blocked'] } },
+      expectedIds: ['mixed-array-allowed', 'mixed-array-empty'],
+    },
+    {
+      name: 'applies the same membership rules to a nested metadata path',
+      filter: { cohort: 'text', 'profile.tags': { $nin: ['blocked'] } },
+      expectedIds: ['text-array-allowed', 'text-array-empty', 'text-array-null', 'text-scalar-allowed'],
+    },
+    {
+      name: 'matches every value, including missing fields and JSON nulls, for an empty exclusion list',
+      filter: { cohort: 'text', tags: { $nin: [] } },
+      expectedIds: fixtures.filter(fixture => fixture.metadata.cohort === 'text').map(fixture => fixture.id),
+    },
+    {
+      name: 'excludes missing fields and scalar JSON nulls for a nonempty exclusion list',
+      filter: { cohort: 'absent', tags: { $nin: ['blocked'] } },
+      expectedIds: [],
+    },
+    {
+      name: 'keeps positive $in matching scalars and arrays that contain an included element',
+      filter: { cohort: 'text', tags: { $in: ['blocked'] } },
+      expectedIds: ['text-array-mixed', 'text-array-blocked', 'text-scalar-blocked'],
+    },
+  ];
+
+  let vector: OracleVector;
+  let indexCreated = false;
+  const indexName = `oracle_nin_${randomUUID().replaceAll('-', '')}`;
+
+  beforeAll(async () => {
+    vector = new OracleVector({
+      id: 'oracle-vector-nin-integration',
+      user: process.env.ORACLE_DATABASE_USER,
+      password: process.env.ORACLE_DATABASE_PASSWORD,
+      connectString: process.env.ORACLE_DATABASE_CONNECT_STRING,
+      tablePrefix: 'ORACLE_IT_NIN_VEC',
+      defaultIndexConfig: { type: 'none' },
+    });
+
+    await vector.createIndex({ indexName, dimension: 3, metric: 'cosine', buildIndex: false });
+    indexCreated = true;
+    await vector.upsert({
+      indexName,
+      ids: fixtures.map(fixture => fixture.id),
+      vectors: fixtures.map(() => [0.1, 0.2, 0.3]),
+      metadata,
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    if (!vector) return;
+    try {
+      if (indexCreated) await vector.deleteIndex({ indexName });
+    } finally {
+      await vector.disconnect();
+    }
+  }, 60_000);
+
+  describe.each(['metadata-only', 'vector-search'] as const)('%s queries', mode => {
+    it.each(cases)('$name', async ({ filter, expectedIds }) => {
+      const results = await vector.query({
+        indexName,
+        filter,
+        topK: fixtures.length,
+        ...(mode === 'vector-search' ? { queryVector: [0.1, 0.2, 0.3], queryMode: 'exact' as const } : {}),
+      });
+
+      // All matches fit within topK; ordering is irrelevant to membership.
+      expect(results.map(result => result.id).sort()).toEqual([...expectedIds].sort());
+    });
+  });
+});
+
+// Oracle size() also returns 1 for scalars and objects. Only JSON arrays should
+// match Mastra's size filter, regardless of their element types or field path.
+describeIntegration('OracleVector $size compatibility', () => {
+  const fixtures: { id: string; metadata: Record<string, unknown> }[] = [
+    { id: 'array-empty', metadata: { tags: [] } },
+    { id: 'array-one-string', metadata: { tags: ['allowed'] } },
+    { id: 'array-one-null', metadata: { tags: [null] } },
+    { id: 'array-one-object', metadata: { tags: [{ label: 'allowed' }] } },
+    { id: 'array-one-array', metadata: { tags: [[]] } },
+    { id: 'array-two-values', metadata: { tags: ['allowed', 'other'] } },
+    { id: 'array-two-arrays', metadata: { tags: [[], [1]] } },
+    { id: 'array-three-values', metadata: { tags: [1, 'allowed', null] } },
+    { id: 'scalar-string', metadata: { tags: 'allowed' } },
+    { id: 'scalar-empty-string', metadata: { tags: '' } },
+    { id: 'scalar-number', metadata: { tags: 42 } },
+    { id: 'scalar-true', metadata: { tags: true } },
+    { id: 'scalar-false', metadata: { tags: false } },
+    { id: 'object-empty', metadata: { tags: {} } },
+    { id: 'object-one-field', metadata: { tags: { label: 'allowed' } } },
+    { id: 'object-two-fields', metadata: { tags: { first: 1, second: 2 } } },
+    { id: 'json-null', metadata: { tags: null } },
+    { id: 'missing-field', metadata: {} },
+    { id: 'missing-parent', metadata: {} },
+    { id: 'null-parent', metadata: { profile: null } },
+    { id: 'scalar-parent', metadata: { profile: 'allowed' } },
+  ];
+  const metadata = fixtures.map(fixture => {
+    if (fixture.id === 'missing-parent' || Object.hasOwn(fixture.metadata, 'profile')) return fixture.metadata;
+    return {
+      ...fixture.metadata,
+      profile: Object.hasOwn(fixture.metadata, 'tags') ? { tags: fixture.metadata.tags } : {},
+    };
+  });
+  const cases = [
+    { size: 0, expectedIds: ['array-empty'] },
+    { size: 1, expectedIds: ['array-one-string', 'array-one-null', 'array-one-object', 'array-one-array'] },
+    { size: 2, expectedIds: ['array-two-values', 'array-two-arrays'] },
+  ];
+
+  let vector: OracleVector;
+  let indexCreated = false;
+  const indexName = `oracle_size_${randomUUID().replaceAll('-', '')}`;
+
+  beforeAll(async () => {
+    vector = new OracleVector({
+      id: 'oracle-vector-size-integration',
+      user: process.env.ORACLE_DATABASE_USER,
+      password: process.env.ORACLE_DATABASE_PASSWORD,
+      connectString: process.env.ORACLE_DATABASE_CONNECT_STRING,
+      tablePrefix: 'ORACLE_IT_SIZE_VEC',
+      defaultIndexConfig: { type: 'none' },
+    });
+
+    await vector.createIndex({ indexName, dimension: 3, metric: 'cosine', buildIndex: false });
+    indexCreated = true;
+    await vector.upsert({
+      indexName,
+      ids: fixtures.map(fixture => fixture.id),
+      vectors: fixtures.map(() => [0.1, 0.2, 0.3]),
+      metadata,
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    if (!vector) return;
+    try {
+      if (indexCreated) await vector.deleteIndex({ indexName });
+    } finally {
+      await vector.disconnect();
+    }
+  }, 60_000);
+
+  describe.each(['tags', 'profile.tags'])('field %s', path => {
+    describe.each(['metadata-only', 'vector-search'] as const)('%s queries', mode => {
+      it.each(cases)('matches only arrays with length $size', async ({ size, expectedIds }) => {
+        const results = await vector.query({
+          indexName,
+          filter: { [path]: { $size: size } },
+          topK: fixtures.length,
+          ...(mode === 'vector-search' ? { queryVector: [0.1, 0.2, 0.3], queryMode: 'exact' as const } : {}),
+        });
+
+        // Include every possible match so extra scalar/object rows cannot hide behind topK.
+        expect(results.map(result => result.id).sort()).toEqual([...expectedIds].sort());
+      });
+    });
+  });
+});
+
+describeIntegration('OracleVector empty $all compatibility', () => {
+  const fixtures: { id: string; metadata: Record<string, unknown> }[] = [
+    { id: 'array-both', metadata: { tags: ['oracle', 'mastra'], kind: 'selected' } },
+    { id: 'array-one', metadata: { tags: ['oracle'], kind: 'other' } },
+    { id: 'array-empty', metadata: { tags: [], kind: 'other' } },
+    { id: 'scalar-string', metadata: { tags: 'oracle', kind: 'other' } },
+    { id: 'scalar-number', metadata: { tags: 42, kind: 'other' } },
+    { id: 'scalar-boolean', metadata: { tags: true, kind: 'other' } },
+    { id: 'object', metadata: { tags: { tier: 'gold' }, kind: 'other' } },
+    { id: 'json-null', metadata: { tags: null, kind: 'other' } },
+    { id: 'missing-field', metadata: { kind: 'other' } },
+  ];
+  const metadata = fixtures.map(fixture => ({
+    ...fixture.metadata,
+    profile: Object.hasOwn(fixture.metadata, 'tags') ? { tags: fixture.metadata.tags } : {},
+  }));
+  const allIds = fixtures.map(fixture => fixture.id);
+  const cases: { name: string; filter: OracleVectorFilter; expectedIds: string[] }[] = [
+    { name: 'matches no records regardless of stored field type', filter: { tags: { $all: [] } }, expectedIds: [] },
+    { name: 'matches no records at a nested path', filter: { 'profile.tags': { $all: [] } }, expectedIds: [] },
+    {
+      name: 'matches no records when combined with AND',
+      filter: { $and: [{ tags: { $all: [] } }, { kind: 'selected' }] },
+      expectedIds: [],
+    },
+    {
+      name: 'lets only the other OR branch match',
+      filter: { $or: [{ tags: { $all: [] } }, { kind: 'selected' }] },
+      expectedIds: ['array-both'],
+    },
+    {
+      name: 'matches no records when OR combines two match-none filters',
+      filter: { $or: [{ tags: { $all: [] } }, { tags: { $in: [] } }] },
+      expectedIds: [],
+    },
+    { name: 'matches every record when negated', filter: { $not: { tags: { $all: [] } } }, expectedIds: allIds },
+    {
+      name: 'keeps nonempty all requiring every requested element',
+      filter: { tags: { $all: ['oracle', 'mastra'] } },
+      expectedIds: ['array-both'],
+    },
+    {
+      name: 'preserves the current empty contains behavior',
+      filter: { tags: { $contains: [] } },
+      expectedIds: allIds,
+    },
+  ];
+
+  let vector: OracleVector;
+  let indexCreated = false;
+  const indexName = `oracle_all_empty_${randomUUID().replaceAll('-', '')}`;
+
+  beforeAll(async () => {
+    vector = new OracleVector({
+      id: 'oracle-vector-empty-all-integration',
+      user: process.env.ORACLE_DATABASE_USER,
+      password: process.env.ORACLE_DATABASE_PASSWORD,
+      connectString: process.env.ORACLE_DATABASE_CONNECT_STRING,
+      tablePrefix: 'ORACLE_IT_ALL_VEC',
+      defaultIndexConfig: { type: 'none' },
+    });
+
+    await vector.createIndex({ indexName, dimension: 3, metric: 'cosine', buildIndex: false });
+    indexCreated = true;
+    await vector.upsert({
+      indexName,
+      ids: allIds,
+      vectors: fixtures.map(() => [0.1, 0.2, 0.3]),
+      metadata,
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    if (!vector) return;
+    try {
+      if (indexCreated) await vector.deleteIndex({ indexName });
+    } finally {
+      await vector.disconnect();
+    }
+  }, 60_000);
+
+  describe.each(['metadata-only', 'vector-search'] as const)('%s queries', mode => {
+    it.each(cases)('$name', async ({ filter, expectedIds }) => {
+      const results = await vector.query({
+        indexName,
+        filter,
+        topK: fixtures.length,
+        ...(mode === 'vector-search' ? { queryVector: [0.1, 0.2, 0.3], queryMode: 'exact' as const } : {}),
+      });
+
+      expect(results.map(result => result.id).sort()).toEqual([...expectedIds].sort());
+    });
+  });
+});
+
+describeIntegration('OracleVector null equality compatibility', () => {
+  const fixtures: { id: string; metadata: Record<string, unknown> }[] = [
+    { id: 'explicit-null', metadata: { value: null } },
+    { id: 'missing-field', metadata: {} },
+    { id: 'empty-string', metadata: { value: '' } },
+    { id: 'string-null', metadata: { value: 'null' } },
+    { id: 'string-value', metadata: { value: 'present' } },
+    { id: 'number-zero', metadata: { value: 0 } },
+    { id: 'number-value', metadata: { value: 42 } },
+    { id: 'boolean-false', metadata: { value: false } },
+    { id: 'boolean-true', metadata: { value: true } },
+    { id: 'array-empty', metadata: { value: [] } },
+    { id: 'array-null', metadata: { value: [null] } },
+    { id: 'array-string', metadata: { value: ['present'] } },
+    { id: 'array-mixed-null', metadata: { value: [null, 'present'] } },
+    { id: 'array-nested', metadata: { value: [[]] } },
+    { id: 'object-empty', metadata: { value: {} } },
+    { id: 'object-value', metadata: { value: { inner: 'present' } } },
+    { id: 'object-null', metadata: { value: { inner: null } } },
+    { id: 'missing-parent', metadata: {} },
+    { id: 'null-parent', metadata: { profile: null } },
+    { id: 'scalar-parent', metadata: { profile: 42 } },
+  ];
+  const metadata = fixtures.map(fixture => {
+    if (fixture.id === 'missing-parent' || Object.hasOwn(fixture.metadata, 'profile')) return fixture.metadata;
+    return {
+      ...fixture.metadata,
+      profile: Object.hasOwn(fixture.metadata, 'value') ? { value: fixture.metadata.value } : {},
+    };
+  });
+  const allIds = fixtures.map(fixture => fixture.id);
+  const missingIds = ['missing-field', 'missing-parent', 'null-parent', 'scalar-parent'];
+  const nullOrMissingIds = ['explicit-null', ...missingIds];
+  const nonNullIds = allIds.filter(id => !nullOrMissingIds.includes(id));
+  const presentIds = allIds.filter(id => !missingIds.includes(id));
+
+  let vector: OracleVector;
+  let indexCreated = false;
+  const indexName = `oracle_null_${randomUUID().replaceAll('-', '')}`;
+
+  beforeAll(async () => {
+    vector = new OracleVector({
+      id: 'oracle-vector-null-integration',
+      user: process.env.ORACLE_DATABASE_USER,
+      password: process.env.ORACLE_DATABASE_PASSWORD,
+      connectString: process.env.ORACLE_DATABASE_CONNECT_STRING,
+      tablePrefix: 'ORACLE_IT_NULL_VEC',
+      defaultIndexConfig: { type: 'none' },
+    });
+
+    await vector.createIndex({ indexName, dimension: 3, metric: 'cosine', buildIndex: false });
+    indexCreated = true;
+    await vector.upsert({
+      indexName,
+      ids: allIds,
+      vectors: fixtures.map(() => [0.1, 0.2, 0.3]),
+      metadata,
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    if (!vector) return;
+    try {
+      if (indexCreated) await vector.deleteIndex({ indexName });
+    } finally {
+      await vector.disconnect();
+    }
+  }, 60_000);
+
+  describe.each(['value', 'profile.value'])('field %s', path => {
+    const cases: { name: string; filter: OracleVectorFilter; expectedIds: string[] }[] = [
+      {
+        name: 'null equality matches only explicit JSON null or a missing field',
+        filter: { [path]: { $eq: null } },
+        expectedIds: nullOrMissingIds,
+      },
+      {
+        name: 'null inequality includes arrays, objects, and empty strings but excludes null or missing',
+        filter: { [path]: { $ne: null } },
+        expectedIds: nonNullIds,
+      },
+      {
+        name: 'direct null values behave like explicit equality',
+        filter: { [path]: null },
+        expectedIds: nullOrMissingIds,
+      },
+      {
+        name: 'negated null equality matches present non-null fields',
+        filter: { $not: { [path]: { $eq: null } } },
+        expectedIds: nonNullIds,
+      },
+      {
+        name: 'negated null inequality matches null or missing fields',
+        filter: { $not: { [path]: { $ne: null } } },
+        expectedIds: nullOrMissingIds,
+      },
+      {
+        name: 'Oracle existence combined with null equality selects only explicit JSON null',
+        filter: { [path]: { $eq: null, $exists: true } },
+        expectedIds: ['explicit-null'],
+      },
+      {
+        name: 'Oracle existence still includes explicit JSON null, arrays, objects, and empty strings',
+        filter: { [path]: { $exists: true } },
+        expectedIds: presentIds,
+      },
+      {
+        name: 'Oracle absence still matches only missing fields',
+        filter: { [path]: { $exists: false } },
+        expectedIds: missingIds,
+      },
+    ];
+
+    describe.each(['metadata-only', 'vector-search'] as const)('%s queries', mode => {
+      it.each(cases)('$name', async ({ filter, expectedIds }) => {
+        const results = await vector.query({
+          indexName,
+          filter,
+          topK: fixtures.length,
+          ...(mode === 'vector-search' ? { queryVector: [0.1, 0.2, 0.3], queryMode: 'exact' as const } : {}),
+        });
+
+        expect(results.map(result => result.id).sort()).toEqual([...expectedIds].sort());
+      });
+    });
+  });
+});
+
+// Match ASCII fixtures with Oracle's regex engine rather than inferring behavior from SQL shape.
+// The proposed flags are i (ignore case), m (multiline anchors), and s (dot matches newline).
+describeIntegration('OracleVector regex matching', () => {
+  const fixtures: { id: string; metadata: Record<string, unknown> }[] = [
+    { id: 'lowercase', metadata: { value: 'oracle database', cohort: 'allowed' } },
+    { id: 'uppercase', metadata: { value: 'ORACLE DATABASE', cohort: 'allowed' } },
+    { id: 'mixed-case', metadata: { value: 'Oracle Database', cohort: 'allowed' } },
+    { id: 'blocked', metadata: { value: 'oracle database', cohort: 'blocked' } },
+    { id: 'surrounding-text', metadata: { value: 'before oracle database after', cohort: 'allowed' } },
+    { id: 'multiline-lowercase', metadata: { value: 'before\noracle database\nafter', cohort: 'allowed' } },
+    { id: 'multiline-uppercase', metadata: { value: 'before\nORACLE DATABASE\nafter', cohort: 'allowed' } },
+    { id: 'newline-lowercase', metadata: { value: 'oracle\ndatabase', cohort: 'allowed' } },
+    { id: 'newline-uppercase', metadata: { value: 'ORACLE\nDATABASE', cohort: 'allowed' } },
+    { id: 'nonmatching', metadata: { value: 'other', cohort: 'allowed' } },
+    { id: 'json-null', metadata: { value: null, cohort: 'allowed' } },
+    { id: 'missing-field', metadata: { cohort: 'allowed' } },
+    { id: 'array-value', metadata: { value: ['oracle database'], cohort: 'allowed' } },
+    { id: 'object-value', metadata: { value: { label: 'oracle database' }, cohort: 'allowed' } },
+  ];
+  const metadata = fixtures.map(fixture => ({
+    ...fixture.metadata,
+    profile: Object.hasOwn(fixture.metadata, 'value') ? { value: fixture.metadata.value } : {},
+  }));
+  const caseSensitiveIds = ['lowercase', 'blocked'];
+  const ignoreCaseIds = ['lowercase', 'uppercase', 'mixed-case', 'blocked'];
+  const multilineIds = [...caseSensitiveIds, 'multiline-lowercase'];
+  const dotAllIds = [...caseSensitiveIds, 'newline-lowercase'];
+  const ignoreCaseMultilineIds = [...ignoreCaseIds, 'multiline-lowercase', 'multiline-uppercase'];
+  const combinedIds = [...ignoreCaseMultilineIds, 'newline-lowercase', 'newline-uppercase'];
+
+  let vector: OracleVector;
+  let indexCreated = false;
+  const indexName = `oracle_regex_${randomUUID().replaceAll('-', '')}`;
+
+  beforeAll(async () => {
+    vector = new OracleVector({
+      id: 'oracle-vector-regex-integration',
+      user: process.env.ORACLE_DATABASE_USER,
+      password: process.env.ORACLE_DATABASE_PASSWORD,
+      connectString: process.env.ORACLE_DATABASE_CONNECT_STRING,
+      tablePrefix: 'ORACLE_IT_REGEX_VEC',
+      defaultIndexConfig: { type: 'none' },
+    });
+
+    await vector.createIndex({ indexName, dimension: 3, metric: 'cosine', buildIndex: false });
+    indexCreated = true;
+    await vector.upsert({
+      indexName,
+      ids: fixtures.map(fixture => fixture.id),
+      vectors: fixtures.map(() => [0.1, 0.2, 0.3]),
+      metadata,
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    if (!vector) return;
+    try {
+      if (indexCreated) await vector.deleteIndex({ indexName });
+    } finally {
+      await vector.disconnect();
+    }
+  }, 60_000);
+
+  describe.each(['value', 'profile.value'])('field %s', path => {
+    const fieldFilter = (condition: unknown): OracleVectorFilter => ({ [path]: condition }) as OracleVectorFilter;
+    const cases: { name: string; filter: OracleVectorFilter; expectedIds: string[] }[] = [
+      {
+        name: 'a direct RegExp is case-sensitive and anchors the whole value by default',
+        filter: fieldFilter(/^oracle database$/),
+        expectedIds: caseSensitiveIds,
+      },
+      {
+        name: 'a string $regex has the same default matching as a direct RegExp',
+        filter: fieldFilter({ $regex: '^oracle database$' }),
+        expectedIds: caseSensitiveIds,
+      },
+      {
+        name: 'empty $options preserves default matching',
+        filter: fieldFilter({ $regex: '^oracle database$', $options: '' }),
+        expectedIds: caseSensitiveIds,
+      },
+      {
+        name: 'a direct RegExp honors i',
+        filter: fieldFilter(/^oracle database$/i),
+        expectedIds: ignoreCaseIds,
+      },
+      {
+        name: '$options i matches the same records as a direct RegExp',
+        filter: fieldFilter({ $regex: '^oracle database$', $options: 'i' }),
+        expectedIds: ignoreCaseIds,
+      },
+      {
+        name: 'a RegExp operand inside $regex preserves its pattern and flags',
+        filter: fieldFilter({ $regex: /^oracle database$/i }),
+        expectedIds: ignoreCaseIds,
+      },
+      {
+        name: 'the existing leading (?i) form keeps case-insensitive matching',
+        filter: fieldFilter({ $regex: '(?i)^oracle database$' }),
+        expectedIds: ignoreCaseIds,
+      },
+      {
+        name: 'a direct RegExp honors m without making dot match newline',
+        filter: fieldFilter(/^oracle.*database$/m),
+        expectedIds: multilineIds,
+      },
+      {
+        name: '$options m matches the same records as a direct RegExp',
+        filter: fieldFilter({ $regex: '^oracle.*database$', $options: 'm' }),
+        expectedIds: multilineIds,
+      },
+      {
+        name: 'a direct RegExp honors s without enabling multiline anchors',
+        filter: fieldFilter(/^oracle.*database$/s),
+        expectedIds: dotAllIds,
+      },
+      {
+        name: '$options s matches the same records as a direct RegExp',
+        filter: fieldFilter({ $regex: '^oracle.*database$', $options: 's' }),
+        expectedIds: dotAllIds,
+      },
+      {
+        name: 'a direct RegExp combines i and m',
+        filter: fieldFilter(/^oracle.*database$/im),
+        expectedIds: ignoreCaseMultilineIds,
+      },
+      {
+        name: '$options im matches the same records as a direct RegExp',
+        filter: fieldFilter({ $regex: '^oracle.*database$', $options: 'im' }),
+        expectedIds: ignoreCaseMultilineIds,
+      },
+      {
+        name: 'a direct RegExp combines i, m, and s',
+        filter: fieldFilter(/^oracle.*database$/ims),
+        expectedIds: combinedIds,
+      },
+      {
+        name: '$options ims matches the same records as a direct RegExp',
+        filter: fieldFilter({ $regex: '^oracle.*database$', $options: 'ims' }),
+        expectedIds: combinedIds,
+      },
+      {
+        name: 'regex normalization preserves a following condition on the same field',
+        filter: fieldFilter({ $regex: '^oracle database$', $options: 'i', $ne: 'ORACLE DATABASE' }),
+        expectedIds: ['lowercase', 'mixed-case', 'blocked'],
+      },
+      {
+        name: 'regex normalization preserves a preceding condition on the same field',
+        filter: fieldFilter({ $ne: 'ORACLE DATABASE', $regex: '^oracle database$', $options: 'i' }),
+        expectedIds: ['lowercase', 'mixed-case', 'blocked'],
+      },
+      {
+        name: 'regex normalization preserves conditions on another field',
+        filter: { ...fieldFilter({ $regex: '^oracle database$', $options: 'i' }), cohort: 'allowed' },
+        expectedIds: ['lowercase', 'uppercase', 'mixed-case'],
+      },
+      {
+        name: 'regex options work inside a logical OR',
+        filter: { $or: [fieldFilter({ $regex: '^oracle database$', $options: 'i' }), fieldFilter({ $eq: 'other' })] },
+        expectedIds: [...ignoreCaseIds, 'nonmatching'],
+      },
+    ];
+
+    describe.each(['metadata-only', 'vector-search'] as const)('%s queries', mode => {
+      it.each(cases)('$name', async ({ filter, expectedIds }) => {
+        const results = await vector.query({
+          indexName,
+          filter,
+          topK: fixtures.length,
+          ...(mode === 'vector-search' ? { queryVector: [0.1, 0.2, 0.3], queryMode: 'exact' as const } : {}),
+        });
+
+        // Every match fits within topK; compare membership independently of distance ordering.
+        expect(results.map(result => result.id).sort()).toEqual([...expectedIds].sort());
+      });
+    });
+  });
+});
+
+// Scalar range comparisons have an operand-type decision and a separate stored-type decision.
+// Numeric operands should accept only JSON numbers, while string operands retain text extraction.
+describeIntegration('OracleVector scalar range comparisons', () => {
+  const fixtures: { id: string; metadata: Record<string, unknown> }[] = [
+    { id: 'number-zero', metadata: { value: 0 } },
+    { id: 'number-two', metadata: { value: 2 } },
+    { id: 'number-ten', metadata: { value: 10 } },
+    { id: 'number-twenty', metadata: { value: 20 } },
+    { id: 'string-zero', metadata: { value: '0' } },
+    { id: 'string-two', metadata: { value: '2' } },
+    { id: 'string-ten', metadata: { value: '10' } },
+    { id: 'string-twenty', metadata: { value: '20' } },
+    { id: 'string-nonnumeric', metadata: { value: 'N/A' } },
+    { id: 'string-empty', metadata: { value: '' } },
+    { id: 'boolean-false', metadata: { value: false } },
+    { id: 'boolean-true', metadata: { value: true } },
+    { id: 'array-empty', metadata: { value: [] } },
+    { id: 'array-number', metadata: { value: [20] } },
+    { id: 'array-string', metadata: { value: ['20'] } },
+    { id: 'array-mixed', metadata: { value: [2, 20, '20'] } },
+    { id: 'object-empty', metadata: { value: {} } },
+    { id: 'object-number', metadata: { value: { inner: 20 } } },
+    { id: 'json-null', metadata: { value: null } },
+    { id: 'missing-field', metadata: {} },
+    { id: 'missing-parent', metadata: {} },
+    { id: 'null-parent', metadata: { profile: null } },
+    { id: 'scalar-parent', metadata: { profile: 20 } },
+  ];
+  const metadata = fixtures.map(fixture => {
+    if (fixture.id === 'missing-parent' || Object.hasOwn(fixture.metadata, 'profile')) return fixture.metadata;
+    return {
+      ...fixture.metadata,
+      profile: Object.hasOwn(fixture.metadata, 'value') ? { value: fixture.metadata.value } : {},
+    };
+  });
+  const numericIds = ['number-zero', 'number-two', 'number-ten', 'number-twenty'];
+  // Text extraction intentionally includes numeric and boolean scalars. Restricting
+  // textual comparisons to stored JSON strings is a separate, unadopted change.
+  const textualIds = [
+    ...numericIds,
+    'string-zero',
+    'string-two',
+    'string-ten',
+    'string-twenty',
+    'string-nonnumeric',
+    'boolean-false',
+    'boolean-true',
+  ];
+  const textGreaterIds = [
+    'number-two',
+    'number-twenty',
+    'string-two',
+    'string-twenty',
+    'string-nonnumeric',
+    'boolean-false',
+    'boolean-true',
+  ];
+  const textEqualIds = ['number-ten', 'string-ten'];
+  const textLessIds = ['number-zero', 'string-zero'];
+  const ranges = [
+    { operator: '$gt', numericIds: ['number-twenty'], textIds: textGreaterIds },
+    { operator: '$gte', numericIds: ['number-ten', 'number-twenty'], textIds: [...textGreaterIds, ...textEqualIds] },
+    { operator: '$lt', numericIds: ['number-zero', 'number-two'], textIds: textLessIds },
+    {
+      operator: '$lte',
+      numericIds: ['number-zero', 'number-two', 'number-ten'],
+      textIds: [...textLessIds, ...textEqualIds],
+    },
+  ] as const;
+
+  let vector: OracleVector;
+  let indexCreated = false;
+  const indexName = `oracle_range_${randomUUID().replaceAll('-', '')}`;
+
+  beforeAll(async () => {
+    vector = new OracleVector({
+      id: 'oracle-vector-range-integration',
+      user: process.env.ORACLE_DATABASE_USER,
+      password: process.env.ORACLE_DATABASE_PASSWORD,
+      connectString: process.env.ORACLE_DATABASE_CONNECT_STRING,
+      tablePrefix: 'ORACLE_IT_RANGE_VEC',
+      defaultIndexConfig: { type: 'none' },
+    });
+
+    await vector.createIndex({ indexName, dimension: 3, metric: 'cosine', buildIndex: false });
+    indexCreated = true;
+    await vector.upsert({
+      indexName,
+      ids: fixtures.map(fixture => fixture.id),
+      vectors: fixtures.map(() => [0.1, 0.2, 0.3]),
+      metadata,
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    if (!vector) return;
+    try {
+      if (indexCreated) await vector.deleteIndex({ indexName });
+    } finally {
+      await vector.disconnect();
+    }
+  }, 60_000);
+
+  describe.each(['value', 'profile.value'])('field %s', path => {
+    const cases: { name: string; filter: OracleVectorFilter; expectedIds: string[] }[] = [];
+    for (const { operator, numericIds: numericMatches, textIds: textMatches } of ranges) {
+      for (const operand of [10, '10'] as const) {
+        const numeric = typeof operand === 'number';
+        const eligibleIds = numeric ? numericIds : textualIds;
+        const matches: readonly string[] = numeric ? numericMatches : textMatches;
+        const negatedIds = eligibleIds.filter(id => !matches.includes(id));
+        const condition = { [operator]: operand };
+        const label = `${operator} ${numeric ? 'number' : 'string'} operand ${JSON.stringify(operand)}`;
+
+        cases.push(
+          { name: `${label}: positive matching`, filter: { [path]: condition }, expectedIds: [...matches] },
+          {
+            name: `${label}: root NOT excludes incompatible, null, and missing values`,
+            filter: { $not: { [path]: condition } },
+            expectedIds: negatedIds,
+          },
+          {
+            name: `${label}: field NOT excludes incompatible, null, and missing values`,
+            filter: { [path]: { $not: condition } },
+            expectedIds: negatedIds,
+          },
+        );
+      }
+    }
+
+    describe.each(['metadata-only', 'vector-search'] as const)('%s queries', mode => {
+      it.each(cases)('$name', async ({ filter, expectedIds }) => {
+        const results = await vector.query({
+          indexName,
+          filter,
+          topK: fixtures.length,
+          ...(mode === 'vector-search' ? { queryVector: [0.1, 0.2, 0.3], queryMode: 'exact' as const } : {}),
+        });
+
+        // Exact membership checks catch both wrong coercion and FALSE replacing SQL NULL under NOT.
+        expect(results.map(result => result.id).sort()).toEqual([...expectedIds].sort());
+      });
+    });
+  });
+});
+
+// Nonempty array operands require stored arrays, while retaining all-elements membership.
+// The type boundary yields FALSE for non-arrays, so both forms of NOT include them.
+describeIntegration('OracleVector array contains boundary', () => {
+  const fixtures: { id: string; metadata: Record<string, unknown> }[] = [
+    { id: 'array-premium', metadata: { tags: ['premium'] } },
+    { id: 'array-both', metadata: { tags: ['premium', 'vip'] } },
+    { id: 'array-reversed', metadata: { tags: ['vip', 'premium'] } },
+    { id: 'array-extra', metadata: { tags: ['premium', 'vip', 'other'] } },
+    { id: 'array-vip', metadata: { tags: ['vip'] } },
+    { id: 'array-neither', metadata: { tags: ['other'] } },
+    { id: 'array-empty', metadata: { tags: [] } },
+    { id: 'array-prefix', metadata: { tags: ['premium-plan'] } },
+    { id: 'array-case', metadata: { tags: ['Premium'] } },
+    { id: 'array-mixed', metadata: { tags: [null, 42, 'premium'] } },
+    { id: 'scalar-premium', metadata: { tags: 'premium' } },
+    { id: 'scalar-substring', metadata: { tags: 'Premium plan' } },
+    { id: 'scalar-other', metadata: { tags: 'other' } },
+    { id: 'scalar-empty', metadata: { tags: '' } },
+    { id: 'object-keys', metadata: { tags: { premium: true, vip: true } } },
+    { id: 'object-value', metadata: { tags: { label: 'premium' } } },
+    { id: 'number', metadata: { tags: 42 } },
+    { id: 'boolean-false', metadata: { tags: false } },
+    { id: 'boolean-true', metadata: { tags: true } },
+    { id: 'json-null', metadata: { tags: null } },
+    { id: 'missing-field', metadata: {} },
+    { id: 'missing-parent', metadata: {} },
+    { id: 'null-parent', metadata: { profile: null } },
+    { id: 'scalar-parent', metadata: { profile: 'premium' } },
+  ];
+  const metadata = fixtures.map(fixture => {
+    if (fixture.id === 'missing-parent' || Object.hasOwn(fixture.metadata, 'profile')) return fixture.metadata;
+    return {
+      ...fixture.metadata,
+      profile: Object.hasOwn(fixture.metadata, 'tags') ? { tags: fixture.metadata.tags } : {},
+    };
+  });
+  const allIds = fixtures.map(fixture => fixture.id);
+  const singletonIds = ['array-premium', 'array-both', 'array-reversed', 'array-extra', 'array-mixed'];
+  const bothIds = ['array-both', 'array-reversed', 'array-extra'];
+
+  let vector: OracleVector;
+  let indexCreated = false;
+  const indexName = `oracle_contains_${randomUUID().replaceAll('-', '')}`;
+
+  beforeAll(async () => {
+    vector = new OracleVector({
+      id: 'oracle-vector-contains-integration',
+      user: process.env.ORACLE_DATABASE_USER,
+      password: process.env.ORACLE_DATABASE_PASSWORD,
+      connectString: process.env.ORACLE_DATABASE_CONNECT_STRING,
+      tablePrefix: 'ORACLE_IT_CONTAINS_VEC',
+      defaultIndexConfig: { type: 'none' },
+    });
+
+    await vector.createIndex({ indexName, dimension: 3, metric: 'cosine', buildIndex: false });
+    indexCreated = true;
+    await vector.upsert({
+      indexName,
+      ids: allIds,
+      vectors: fixtures.map(() => [0.1, 0.2, 0.3]),
+      metadata,
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    if (!vector) return;
+    try {
+      if (indexCreated) await vector.deleteIndex({ indexName });
+    } finally {
+      await vector.disconnect();
+    }
+  }, 60_000);
+
+  describe.each(['tags', 'profile.tags'])('field %s', path => {
+    const fieldFilter = (condition: unknown): NonNullable<OracleVectorFilter> =>
+      ({ [path]: condition }) as NonNullable<OracleVectorFilter>;
+    const cases: { name: string; filter: OracleVectorFilter; expectedIds: string[] }[] = [];
+    for (const { name, operand, expectedIds } of [
+      { name: 'singleton', operand: ['premium'], expectedIds: singletonIds },
+      { name: 'two elements', operand: ['premium', 'vip'], expectedIds: bothIds },
+    ]) {
+      const negatedIds = allIds.filter(id => !expectedIds.includes(id));
+      cases.push(
+        {
+          name: `${name}: requires an actual array containing every requested element`,
+          filter: fieldFilter({ $contains: operand }),
+          expectedIds,
+        },
+        {
+          name: `${name}: field NOT includes non-arrays, null, missing, and nonmatching arrays`,
+          filter: fieldFilter({ $not: { $contains: operand } }),
+          expectedIds: negatedIds,
+        },
+        {
+          name: `${name}: root NOT includes non-arrays, null, missing, and nonmatching arrays`,
+          filter: { $not: fieldFilter({ $contains: operand }) },
+          expectedIds: negatedIds,
+        },
+      );
+    }
+    cases.push(
+      {
+        name: 'empty array operands still match every row including non-arrays, null, and missing',
+        filter: fieldFilter({ $contains: [] }),
+        expectedIds: allIds,
+      },
+      {
+        name: 'field NOT of an empty operand still matches no rows',
+        filter: fieldFilter({ $not: { $contains: [] } }),
+        expectedIds: [],
+      },
+      {
+        name: 'root NOT of an empty operand still matches no rows',
+        filter: { $not: fieldFilter({ $contains: [] }) },
+        expectedIds: [],
+      },
+      {
+        name: 'string operands retain scalar substring and exact array-element matching',
+        filter: fieldFilter({ $contains: 'premium' }),
+        expectedIds: [...singletonIds, 'scalar-premium', 'scalar-substring'],
+      },
+      {
+        name: 'all retains scalar wrapping and existing element membership',
+        filter: fieldFilter({ $all: ['premium'] }),
+        expectedIds: [...singletonIds, 'scalar-premium'],
+      },
+      {
+        name: 'in retains scalar and array-element membership',
+        filter: fieldFilter({ $in: ['premium'] }),
+        expectedIds: [...singletonIds, 'scalar-premium'],
+      },
+      {
+        name: 'nin retains array exclusion and existing scalar eligibility',
+        filter: fieldFilter({ $nin: ['premium'] }),
+        expectedIds: [
+          'array-vip',
+          'array-neither',
+          'array-empty',
+          'array-prefix',
+          'array-case',
+          'scalar-substring',
+          'scalar-other',
+          'number',
+          'boolean-false',
+          'boolean-true',
+        ],
+      },
+    );
+
+    describe.each(['metadata-only', 'vector-search'] as const)('%s queries', mode => {
+      it.each(cases)('$name', async ({ filter, expectedIds }) => {
+        const results = await vector.query({
+          indexName,
+          filter,
+          topK: fixtures.length,
+          ...(mode === 'vector-search' ? { queryVector: [0.1, 0.2, 0.3], queryMode: 'exact' as const } : {}),
+        });
+
+        // Every match fits in topK. Exact IDs verify type eligibility, path relaxation,
+        // and both forms of negation independently of distance ordering.
+        expect(results.map(result => result.id).sort()).toEqual([...expectedIds].sort());
+      });
+    });
+  });
+});
 
 // Provider-specific tests cover Oracle-only formats, shared pools, and JSON metadata behavior.
 describeIntegration('OracleVector integration', () => {

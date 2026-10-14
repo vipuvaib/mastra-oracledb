@@ -502,6 +502,45 @@ describe('OracleVector hot path SQL shape', () => {
 });
 
 describe('OracleVector operation branches', () => {
+  it.each(['update', 'delete'] as const)('allows a match-none empty all filter for %s', async operation => {
+    const connection = {
+      execute: vi.fn(async (_sql: string) => ({ rowsAffected: 0 })),
+      commit: vi.fn(async () => undefined),
+      rollback: vi.fn(async () => undefined),
+    };
+    const { vector } = createVectorWithConnection(connection);
+    cacheIndex(vector);
+    const filter = { tags: { $all: [] } };
+
+    if (operation === 'update') {
+      await vector.updateVector({ indexName: 'hot_index', filter, update: { metadata: { kind: 'changed' } } });
+    } else {
+      await vector.deleteVectors({ indexName: 'hot_index', filter });
+    }
+
+    expect(connection.execute).toHaveBeenCalledOnce();
+    expect(String(connection.execute.mock.calls[0]?.[0])).toContain('1 = 0');
+    expect(connection.rollback).not.toHaveBeenCalled();
+  });
+
+  it.each(['update', 'delete'] as const)('rejects a negated empty all match-all filter for %s', async operation => {
+    const connection = {
+      execute: vi.fn(async () => ({ rowsAffected: 0 })),
+      commit: vi.fn(async () => undefined),
+      rollback: vi.fn(async () => undefined),
+    };
+    const { vector } = createVectorWithConnection(connection);
+    cacheIndex(vector);
+    const filter = { $not: { tags: { $all: [] } } };
+    const result =
+      operation === 'update'
+        ? vector.updateVector({ indexName: 'hot_index', filter, update: { metadata: { kind: 'changed' } } })
+        : vector.deleteVectors({ indexName: 'hot_index', filter });
+
+    await expect(result).rejects.toThrow(/match-all filter/i);
+    expect(connection.execute).not.toHaveBeenCalled();
+  });
+
   it('rejects destructive operations with match-all filters before executing them', async () => {
     const connection = {
       execute: vi.fn(async () => ({ rows: [], rowsAffected: 1 })),

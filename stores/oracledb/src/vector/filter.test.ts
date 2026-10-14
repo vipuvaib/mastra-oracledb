@@ -13,11 +13,11 @@ describe('buildMetadataWhereClause', () => {
     expect(buildMetadataWhereClause({ $and: [] }).match).toBe('match-all');
     expect(buildMetadataWhereClause({ $nor: [] }).match).toBe('match-all');
     expect(buildMetadataWhereClause({ kind: { $nin: [] } }).match).toBe('match-all');
-    expect(buildMetadataWhereClause({ kind: { $all: [] } }).match).toBe('match-all');
     expect(buildMetadataWhereClause({ tags: { $contains: [] } }).match).toBe('match-all');
 
     expect(buildMetadataWhereClause({ $or: [] }).match).toBe('match-none');
     expect(buildMetadataWhereClause({ kind: { $in: [] } }).match).toBe('match-none');
+    expect(buildMetadataWhereClause({ kind: { $all: [] } }).match).toBe('match-none');
     expect(buildMetadataWhereClause({ kind: 'oracle' }).match).toBe('filtered');
   });
 
@@ -41,7 +41,8 @@ describe('buildMetadataWhereClause', () => {
     });
 
     expect(filter.sql).toContain(' OR ');
-    expect(filter.sql).toContain('RETURNING NUMBER NULL ON ERROR) >= :b0');
+    expect(filter.sql).toContain('@.type() == "number"');
+    expect(filter.sql).toContain('RETURNING NUMBER NULL ON ERROR) ELSE NULL END) >= :b0');
     expect(filter.sql).toContain('IN (:b1, :b2)');
     expect(filter.sql).toContain('JSON_EXISTS(metadata, \'$.kind[*]?(@ == $b3)\' PASSING :b3 AS "b3")');
   });
@@ -101,7 +102,9 @@ describe('buildMetadataWhereClause', () => {
     });
 
     expect(filter.sql).toContain('JSON_EXISTS(metadata, \'$.tags[*]?(@ == $b0)\' PASSING :b0 AS "b0")');
-    expect(filter.sql).toContain('JSON_EXISTS(metadata, \'$.tags?(@.size() == $b2)\' PASSING :b2 AS "b2")');
+    expect(filter.sql).toContain(
+      'JSON_EXISTS(metadata, \'$.tags?(@.type() == "array" && @.size() == $b2)\' PASSING :b2 AS "b2")',
+    );
     expect(filter.sql).toContain('JSON_EXISTS(metadata, \'$.chunks[*]?(@.score >= $b3)\' PASSING :b3 AS "b3")');
   });
 
@@ -151,6 +154,49 @@ describe('buildMetadataWhereClause', () => {
     expect(filter.sql).toContain('true');
   });
 
+  it.each([
+    { values: ['blocked'], returnType: 'VARCHAR2(4000)' },
+    { values: [1], returnType: 'NUMBER' },
+    { values: ['blocked', 1], returnType: 'VARCHAR2(4000)' },
+    { values: [1, 'blocked'], returnType: 'NUMBER' },
+  ])('bypasses scalar $nin extraction for arrays with exclusions $values', ({ values, returnType }) => {
+    const filter = buildMetadataWhereClause({ 'profile.tags': { $nin: values } });
+
+    expect(filter.sql).toContain(
+      'CASE WHEN JSON_EXISTS(metadata, \'$.profile.tags?(@.type() == "array")\') THEN 1 WHEN ',
+    );
+    expect(filter.sql).toContain(`JSON_VALUE(metadata, '$.profile.tags' RETURNING ${returnType} NULL ON ERROR) NOT IN`);
+    expect(filter.sql).toContain('THEN 1 ELSE 0 END = 1 AND NOT (');
+    for (let index = 0; index < values.length; index += 1) {
+      const variable = `b${values.length + index}`;
+      expect(filter.sql).toContain(
+        `JSON_EXISTS(metadata, '$.profile.tags[*]?(@ == $${variable})' PASSING :${variable} AS "${variable}")`,
+      );
+    }
+    expect(Object.values(filter.binds)).toEqual([...values, ...values]);
+    expect(filter.match).toBe('filtered');
+  });
+
+  it('keeps an empty $nin list unconditional without adding type checks or binds', () => {
+    expect(buildMetadataWhereClause({ tags: { $nin: [] } })).toEqual({
+      sql: 'WHERE ((1 = 1))',
+      binds: {},
+      match: 'match-all',
+    });
+  });
+
+  it('keeps positive $in combining scalar membership with array membership', () => {
+    const filter = buildMetadataWhereClause({ tags: { $in: ['blocked'] } });
+
+    expect(filter.sql).toContain(
+      "(JSON_VALUE(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) IN (:b0) OR " +
+        'JSON_EXISTS(metadata, \'$.tags[*]?(@ == $b1)\' PASSING :b1 AS "b1"))',
+    );
+    expect(filter.sql).not.toContain('CASE');
+    expect(filter.binds).toEqual({ b0: 'blocked', b1: 'blocked' });
+    expect(filter.match).toBe('filtered');
+  });
+
   it('supports null comparisons, empty sets, and elemMatch comparison variants', () => {
     const filter = buildMetadataWhereClause({
       deletedAt: { $eq: null },
@@ -160,10 +206,14 @@ describe('buildMetadataWhereClause', () => {
       values: { $elemMatch: { $ne: 'draft', $gt: 1, $lt: 10, $in: ['a', 'b'] } },
     });
 
-    expect(filter.sql).toContain('IS NULL');
-    expect(filter.sql).toContain('IS NOT NULL');
+    expect(filter.sql).toContain(
+      "(NOT JSON_EXISTS(metadata, '$.deletedAt') OR JSON_EXISTS(metadata, '$.deletedAt?(@.type() == \"null\")'))",
+    );
+    expect(filter.sql).toContain(
+      "(JSON_EXISTS(metadata, '$.archivedAt') AND NOT JSON_EXISTS(metadata, '$.archivedAt?(@.type() == \"null\")'))",
+    );
     expect(filter.sql).toContain('1 = 0');
-    expect(filter.sql).toContain('1 = 1');
+    expect(filter.sql).not.toContain('1 = 1');
     expect(filter.sql).toContain('@ != $');
     expect(filter.sql).toContain('@ > $');
     expect(filter.sql).toContain('@ < $');

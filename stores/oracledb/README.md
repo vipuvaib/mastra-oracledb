@@ -99,6 +99,34 @@ record. Coordinate any in-flight memory writes and additional vector cleanup you
 stale observations can survive thread-ID reuse. Don't clear shared resource-scoped observational
 memory as part of deleting a single thread.
 
+### Scalar range filters
+
+For `$gt`, `$gte`, `$lt`, and `$lte`, number operands compare only stored JSON numbers. Numeric strings,
+booleans, arrays, objects, null, and missing fields are excluded, including when the range is negated with
+root or field-level `$not`.
+
+String operands such as `"10"` use textual comparison. Scalar numbers and booleans can still participate
+through Oracle's text extraction; null, missing fields, and nonscalar values are excluded. These rules
+describe scalar ranges; `$elemMatch` evaluates array elements separately.
+
+### Array contains filters
+
+A nonempty array operand for `$contains` requires the stored field to be a JSON array containing every
+requested element. For example, `{ tags: { $contains: ['premium'] } }` matches `['premium', 'vip']`, but
+excludes the scalar `'premium'`. Root or field-level `$not` includes non-array values, including null and
+missing fields, as well as arrays that fail the membership checks.
+
+An empty operand (`$contains: []`) matches every row. String operands use case-insensitive scalar-substring
+matching or exact array-element matching.
+
+### Vector regex filters
+
+Regex filters accept a direct `RegExp` or `$regex` with a string or `RegExp` pattern. String patterns can
+use `$options`, for example `{ title: { $regex: '^oracle', $options: 'im' } }`. Supported flags are `i`
+(ignore case), `m` (multiline anchors), and `s` (dot matches newline). Matching is case-sensitive by default.
+Flags from a `RegExp` and `$options` are combined; the existing leading `(?i)` string form is also supported.
+Unsupported flags and `$options` without `$regex` throw an error. Patterns use Oracle's regex syntax.
+
 ## Documentation
 
 - [Oracle Database integration guide](https://mastra.ai/integrations/databases/oracledb)
