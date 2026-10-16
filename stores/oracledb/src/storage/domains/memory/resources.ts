@@ -143,10 +143,9 @@ export async function updateResource(
 }
 
 /**
- * Upserts one resource row against the given raw connection. Shared by
- * `saveResource` (auto-commit) and `updateResource`, which runs this inside
- * the SAME transaction as the FOR UPDATE lock above, so the merge sees and
- * replaces exactly the row it locked.
+ * Upserts one resource row against the given raw connection. Used by
+ * `updateResource` inside the same transaction as its FOR UPDATE read.
+ * Does not commit; transaction ownership stays with the caller.
  */
 async function mergeResourceRow(
   ctx: Pick<MemoryContext, 'schemaName'>,

@@ -56,6 +56,13 @@ const savedThread = await memory.getThreadById({ threadId: 'thread-123' });
 const { messages } = await memory.listMessages({ threadId: 'thread-123' });
 ```
 
+### Message include windows
+
+Message `include` context is selected by chronological `(createdAt, id)` order. When creation timestamps
+match, message IDs determine which neighbors precede or follow the requested anchor; insertion order
+is not used. Windows stay within the anchor's thread and honor the supplied resource filter, while
+cross-thread includes from the same resource remain supported. Final response sorting is unchanged.
+
 ### Memory lifecycle responsibilities
 
 The `memory` object returned by `store.getStore('memory')` above is the low-level storage adapter,
@@ -98,6 +105,25 @@ deletion and explicitly call `clearObservationalMemory(threadId, resourceId)` fo
 record. Coordinate any in-flight memory writes and additional vector cleanup yourself. Otherwise,
 stale observations can survive thread-ID reuse. Don't clear shared resource-scoped observational
 memory as part of deleting a single thread.
+
+### Vector index deletion
+
+`OracleVector.deleteIndex({ indexName })` deletes only the physical table identified by a matching
+registry entry, including the supported legacy uppercase lookup. If no registry entry exists, deletion
+is a no-op: it doesn't derive a table name or remove an unregistered table. Orphan-table cleanup is a
+separate administrative task. A registered index can still be deleted when its physical table is
+already missing; the stale registry entry is removed.
+
+### Vector index configuration updates
+
+Build, rebuild, and existing-table creation update the registry row selected by lookup, including
+the supported uppercase fallback, without renaming its logical key. Configuration updates must affect
+exactly one registry row and commit before updated metadata is cached. Cached aliases of that row are
+invalidated if the update or commit fails.
+
+Physical index DDL and registry writes are not atomic. If a registry update fails after DDL succeeds,
+the operation reports an error; it does not undo the physical index change. Inspect the physical index
+and registry before retrying. This does not provide cross-instance DDL coordination or cache invalidation.
 
 ### Scalar range filters
 

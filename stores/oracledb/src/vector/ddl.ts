@@ -126,6 +126,8 @@ export class IndexRegistry {
             // Re-running createIndex is allowed when the existing table shape matches the requested shape.
             const tableExists = await this.vectorTableExists(connection, existing.tableName);
             const tableName = tableExists ? existing.tableName : tableNameForIndex(logicalIndexName, this.tablePrefix);
+            // Existing tables retain the key resolved by lookup; recovery below upserts the caller's key.
+            const registryIndexName = tableExists ? existing.indexName : logicalIndexName;
             if (tableExists) {
               this.assertCompatibleExistingIndex(
                 existing,
@@ -169,7 +171,7 @@ export class IndexRegistry {
                 throw vectorIndexAlreadyExistsError('CREATE_INDEX', logicalIndexName, existing);
               }
               if (createdIndex) {
-                await this.updateRegistryIndexConfig(connection, logicalIndexName, normalizedMetric, mergedConfig);
+                await this.updateRegistryIndexConfig(connection, registryIndexName, normalizedMetric, mergedConfig);
               }
             }
             const finalInfo = !tableExists
@@ -317,7 +319,7 @@ export class IndexRegistry {
           }
           return;
         }
-        await this.updateRegistryIndexConfig(connection, logicalIndexName, normalizedMetric, mergedConfig);
+        await this.updateRegistryIndexConfig(connection, indexInfo.indexName, normalizedMetric, mergedConfig);
         this.cacheIndexMetadata(logicalIndexName, {
           ...indexInfo,
           metric: normalizedMetric,
@@ -366,7 +368,7 @@ export class IndexRegistry {
           // must not be advanced to describe a physical index that does not match this config.
           throw vectorIndexAlreadyExistsError('REBUILD_INDEX', logicalIndexName, indexInfo);
         }
-        await this.updateRegistryIndexConfig(connection, logicalIndexName, normalizedMetric, mergedConfig);
+        await this.updateRegistryIndexConfig(connection, indexInfo.indexName, normalizedMetric, mergedConfig);
         this.cacheIndexMetadata(logicalIndexName, {
           ...indexInfo,
           metric: normalizedMetric,
@@ -386,9 +388,13 @@ export class IndexRegistry {
       withConnection(async connection => {
         await this.ensureRegistry(connection);
         const registryRow = await this.getRegistryEntry(connection, logicalIndexName);
-        const tableName = registryRow
-          ? qualifyName(registryRow.tableName, this.schemaName)
-          : this.qualifiedTableName(logicalIndexName);
+        if (!registryRow) {
+          // A derived table name is not proof of ownership: distinct logical names can collide.
+          // Missing indexes are a no-op; unregistered tables require separate orphan cleanup.
+          this.clearIndexMetadata(logicalIndexName);
+          return;
+        }
+        const tableName = qualifyName(registryRow.tableName, this.schemaName);
 
         await executeOracleDdl(connection, `DROP TABLE ${tableName} CASCADE CONSTRAINTS PURGE`, [-942]);
         await connection.execute(
@@ -560,23 +566,37 @@ export class IndexRegistry {
     indexConfig: OracleVectorIndexConfig,
   ): Promise<void> {
     const mergedConfig = this.mergeIndexConfig(indexConfig);
-    await connection.execute(
-      `
-      UPDATE ${this.qualifiedRegistryTable()}
-      SET
-        metric = :metric,
-        index_type = :index_type,
-        accuracy = :accuracy,
-        updated_at = SYSTIMESTAMP
-      WHERE index_name = :indexName`,
-      {
-        indexName,
-        metric,
-        index_type: mergedConfig.type ?? 'none',
-        accuracy: mergedConfig.accuracy ?? 95,
-      },
-    );
-    await connection.commit();
+    try {
+      const result = await connection.execute(
+        `
+        UPDATE ${this.qualifiedRegistryTable()}
+        SET
+          metric = :metric,
+          index_type = :index_type,
+          accuracy = :accuracy,
+          updated_at = SYSTIMESTAMP
+        WHERE index_name = :indexName`,
+        {
+          indexName,
+          metric,
+          index_type: mergedConfig.type ?? 'none',
+          accuracy: mergedConfig.accuracy ?? 95,
+        },
+      );
+      if (result.rowsAffected !== 1) {
+        throw new Error(
+          `Expected to update one registry row for vector index "${indexName}", but updated ${result.rowsAffected ?? 0}. Physical index DDL may already have succeeded; inspect the index and registry before retrying.`,
+        );
+      }
+      await connection.commit();
+    } finally {
+      // DDL is not rolled back with the registry write. Drop every cached alias for
+      // this resolved key on failure, and let successful callers repopulate only
+      // after commit. Other aliases will reload the persisted configuration.
+      for (const [cachedName, cachedInfo] of this.indexInfoCache) {
+        if (cachedInfo.indexName === indexName) this.indexInfoCache.delete(cachedName);
+      }
+    }
   }
 
   async createVectorIndex(

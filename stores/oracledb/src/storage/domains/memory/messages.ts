@@ -196,7 +196,7 @@ export async function saveMessages(
  * Batch-inserts/merges message rows and touches their threads' updatedAt
  * against the given transactional client. Extracted out of `saveMessages` so
  * `cloneThread` (memory/index.ts) can run this in the SAME transaction as the
- * destination thread MERGE — a failure here must not leave an orphaned,
+ * destination thread INSERT — a failure here must not leave an orphaned,
  * message-less cloned thread committed. Does not verify that the owning
  * thread exists; `saveMessages` checks that before opening its transaction.
  */
@@ -553,6 +553,7 @@ async function getIncludedMessages(
     const previousLimit = Math.max(0, item.withPreviousMessages ?? 0) + 1;
     const previousRows = await queryMessageWindow(ctx, connection, {
       threadId: String(target.threadId),
+      anchorId: String(target.id),
       createdAt: target.createdAt as Date | string,
       operator: '<=',
       direction: 'DESC',
@@ -572,6 +573,7 @@ async function getIncludedMessages(
     if (nextLimit > 0) {
       const nextRows = await queryMessageWindow(ctx, connection, {
         threadId: String(target.threadId),
+        anchorId: String(target.id),
         createdAt: target.createdAt as Date | string,
         operator: '>',
         direction: 'ASC',
@@ -596,6 +598,7 @@ async function queryMessageWindow(
   connection: Connection,
   params: {
     threadId: string;
+    anchorId: string;
     createdAt: Date | string;
     operator: '<=' | '>';
     direction: 'ASC' | 'DESC';
@@ -605,10 +608,17 @@ async function queryMessageWindow(
   },
 ): Promise<MastraDBMessage[]> {
   const resourceCondition = params.resourceId ? ` AND ${MESSAGE_RESOURCE_ID} = :${params.bindPrefix}_resourceId` : '';
+  // Match the ORDER BY tie-breaker: the previous window includes the exact
+  // anchor, while the next window starts strictly after its (timestamp, id).
+  const timestampOperator = params.operator === '<=' ? '<' : '>';
+  const timestampBind = `:${params.bindPrefix}_createdAt`;
+  const anchorIdBind = `:${params.bindPrefix}_anchorId`;
+  const windowCondition = `(${MESSAGE_CREATED_AT} ${timestampOperator} ${timestampBind} OR (${MESSAGE_CREATED_AT} = ${timestampBind} AND id ${params.operator} ${anchorIdBind}))`;
   const result = await connection.execute<ObjectRow>(
-    `${messageSelect()} FROM ${table(ctx, TABLE_MESSAGES)} WHERE thread_id = :${params.bindPrefix}_threadId${resourceCondition} AND ${MESSAGE_CREATED_AT} ${params.operator} :${params.bindPrefix}_createdAt ORDER BY ${MESSAGE_CREATED_AT} ${params.direction}, id ${params.direction} FETCH FIRST ${params.limit} ROWS ONLY`,
+    `${messageSelect()} FROM ${table(ctx, TABLE_MESSAGES)} WHERE thread_id = :${params.bindPrefix}_threadId${resourceCondition} AND ${windowCondition} ORDER BY ${MESSAGE_CREATED_AT} ${params.direction}, id ${params.direction} FETCH FIRST ${params.limit} ROWS ONLY`,
     asBindParameters({
       [`${params.bindPrefix}_threadId`]: params.threadId,
+      [`${params.bindPrefix}_anchorId`]: params.anchorId,
       [`${params.bindPrefix}_createdAt`]: params.createdAt,
       ...(params.resourceId ? { [`${params.bindPrefix}_resourceId`]: params.resourceId } : {}),
     }),

@@ -977,6 +977,118 @@ describeIntegration('OracleVector array contains boundary', () => {
   });
 });
 
+// Verify persisted configuration independently of the writer's cache. IVF avoids
+// making these registry regressions depend on HNSW Vector Pool configuration.
+describeIntegration('OracleVector registry configuration identity', () => {
+  const cases = [
+    { name: 'build through an uppercase fallback', operation: 'build', nameStyle: 'fallback' },
+    { name: 'rebuild through an uppercase fallback', operation: 'rebuild', nameStyle: 'fallback' },
+    { name: 'existing-table create through an uppercase fallback', operation: 'create', nameStyle: 'fallback' },
+    { name: 'build with an exact lowercase key', operation: 'build', nameStyle: 'lowercase' },
+    { name: 'build with an exact mixed-case key', operation: 'build', nameStyle: 'mixed' },
+  ] as const;
+
+  it.each(cases)(
+    'persists the resolved registry identity for $name',
+    async ({ operation, nameStyle }) => {
+      const suffix = randomUUID().replaceAll('-', '');
+      const registeredName =
+        nameStyle === 'fallback'
+          ? `REGISTRY_CONFIG_${suffix.toUpperCase()}`
+          : nameStyle === 'mixed'
+            ? `Registry_Config_${suffix}`
+            : `registry_config_${suffix}`;
+      const callerName = nameStyle === 'fallback' ? registeredName.toLowerCase() : registeredName;
+      const registryTableName = 'ORACLE_IT_CONFIG_REGISTRY';
+      const config = {
+        user: process.env.ORACLE_DATABASE_USER,
+        password: process.env.ORACLE_DATABASE_PASSWORD,
+        connectString: process.env.ORACLE_DATABASE_CONNECT_STRING,
+        tablePrefix: 'ORACLE_IT_CONFIG_VEC',
+        registryTableName,
+        defaultIndexConfig: { type: 'none' as const },
+        defaultMetadataIndexes: [],
+      };
+      const writer = new OracleVector({ ...config, id: `oracle-config-writer-${suffix}` });
+      const reader = new OracleVector({ ...config, id: `oracle-config-reader-${suffix}` });
+      const probe = new OracleStore({
+        id: `oracle-config-probe-${suffix}`,
+        user: config.user,
+        password: config.password,
+        connectString: config.connectString,
+        disableInit: true,
+      });
+      const indexConfig = { type: 'ivf' as const, accuracy: 87, ivf: { neighborPartitions: 1 } };
+      const ids = Array.from({ length: 32 }, (_, index) => `config-vector-${index}`);
+      const vectors = ids.map((_, index) => (index === 0 ? [1, 0, 0] : [(index % 5) / 7 + 0.1, (index + 1) / 33, 0.1]));
+
+      try {
+        await writer.createIndex({ indexName: registeredName, dimension: 3, metric: 'cosine', buildIndex: false });
+        await writer.upsert({ indexName: registeredName, ids, vectors });
+        if (operation === 'rebuild') {
+          // Establish an actual pre-existing physical index with a correctly keyed write.
+          await writer.buildIndex({ indexName: registeredName, indexConfig: { ...indexConfig, accuracy: 90 } });
+        }
+        // Warm both alias/canonical cache entries before attempting the transition.
+        await expect(writer.describeIndex({ indexName: callerName })).resolves.toMatchObject({
+          indexName: registeredName,
+          indexType: operation === 'rebuild' ? 'ivf' : 'none',
+          metric: 'cosine',
+          accuracy: operation === 'rebuild' ? 90 : 95,
+        });
+
+        if (operation === 'build') {
+          await writer.buildIndex({ indexName: callerName, indexConfig });
+        } else if (operation === 'rebuild') {
+          await writer.rebuildIndex({ indexName: callerName, metric: 'euclidean', indexConfig });
+        } else {
+          await writer.createIndex({ indexName: callerName, dimension: 3, metric: 'cosine', indexConfig });
+        }
+
+        const expected = {
+          indexName: registeredName,
+          metric: operation === 'rebuild' ? 'euclidean' : 'cosine',
+          indexType: 'ivf',
+          accuracy: 87,
+        };
+        // Inspect persisted rows directly: an alias must not create a second key or
+        // leave old config hidden behind the writer's optimistic metadata cache.
+        const persisted = await probe.db.execute<{
+          indexName: string;
+          metric: string;
+          indexType: string;
+          accuracy: number;
+        }>(
+          `SELECT index_name AS "indexName", metric AS "metric", index_type AS "indexType", accuracy AS "accuracy"
+         FROM "ORACLE_IT_CONFIG_REGISTRY" WHERE index_name IN (:registeredName, :callerName)`,
+          { registeredName, callerName },
+        );
+        expect(persisted).toEqual([expected]);
+        await expect(writer.describeIndex({ indexName: callerName })).resolves.toMatchObject(expected);
+        await expect(writer.describeIndex({ indexName: registeredName })).resolves.toMatchObject(expected);
+        // This provider has not looked up the index before, so it cannot reuse the
+        // writer's cache. Both spellings must resolve to the same persisted row.
+        await expect(reader.describeIndex({ indexName: callerName })).resolves.toMatchObject({
+          ...expected,
+          count: 32,
+        });
+        await expect(reader.describeIndex({ indexName: registeredName })).resolves.toMatchObject(expected);
+        await expect(
+          reader.query({ indexName: callerName, queryVector: [1, 0, 0], topK: 1, queryMode: 'exact' }),
+        ).resolves.toMatchObject([{ id: 'config-vector-0' }]);
+      } finally {
+        // Delete only the uniquely named, registered fixture, even if an assertion fails.
+        try {
+          await writer.deleteIndex({ indexName: registeredName });
+        } finally {
+          await Promise.all([writer.disconnect(), reader.disconnect(), probe.disconnect()]);
+        }
+      }
+    },
+    60_000,
+  );
+});
+
 // Provider-specific tests cover Oracle-only formats, shared pools, and JSON metadata behavior.
 describeIntegration('OracleVector integration', () => {
   it('stores, filters, queries, updates, and deletes vectors in Oracle AI Database', async () => {
@@ -1388,6 +1500,51 @@ describeIntegration('OracleVector integration', () => {
     } finally {
       await vector.deleteIndex({ indexName }).catch(() => undefined);
       await vector.disconnect();
+    }
+  });
+
+  it('keeps registered vectors queryable after deleting an unknown colliding logical name', async () => {
+    const suffix = randomUUID().replace(/-/g, '');
+    const registeredName = `tenant-${suffix}`;
+    const unknownName = `tenant_${suffix}`;
+    const tablePrefix = 'ORACLE_IT_DELETE_VEC';
+    expect(tableNameForIndex(unknownName, tablePrefix)).toBe(tableNameForIndex(registeredName, tablePrefix));
+    const vector = new OracleVector({
+      id: `oracle-vector-delete-regression-${suffix}`,
+      user: process.env.ORACLE_DATABASE_USER,
+      password: process.env.ORACLE_DATABASE_PASSWORD,
+      connectString: process.env.ORACLE_DATABASE_CONNECT_STRING,
+      tablePrefix,
+      registryTableName: 'ORACLE_IT_DELETE_REGISTRY',
+      defaultIndexConfig: { type: 'none' },
+      defaultMetadataIndexes: [],
+    });
+
+    try {
+      await vector.createIndex({ indexName: registeredName, dimension: 3, buildIndex: false });
+      await vector.upsert({
+        indexName: registeredName,
+        ids: ['kept-vector'],
+        vectors: [[1, 0, 0]],
+        metadata: [{ owner: registeredName }],
+      });
+      await expect(vector.query({ indexName: registeredName, queryVector: [1, 0, 0], topK: 1 })).resolves.toMatchObject(
+        [{ id: 'kept-vector', metadata: { owner: registeredName } }],
+      );
+
+      await expect(vector.deleteIndex({ indexName: unknownName })).resolves.toBeUndefined();
+
+      expect(await vector.listIndexes()).toContain(registeredName);
+      const results = await vector.query({ indexName: registeredName, queryVector: [1, 0, 0], topK: 1 });
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({ id: 'kept-vector', metadata: { owner: registeredName } });
+    } finally {
+      // Clean up only our known registered index, never a guessed orphan table.
+      try {
+        await vector.deleteIndex({ indexName: registeredName });
+      } finally {
+        await vector.disconnect();
+      }
     }
   });
 
