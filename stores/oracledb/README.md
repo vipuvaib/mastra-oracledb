@@ -114,6 +114,11 @@ is a no-op: it doesn't derive a table name or remove an unregistered table. Orph
 separate administrative task. A registered index can still be deleted when its physical table is
 already missing; the stale registry entry is removed.
 
+Each call resolves the exact key first, then the legacy uppercase fallback, and deletes only that
+registry row. A separate uppercase entry survives deletion of an exact lowercase or mixed-case entry.
+Subsequent calls still use the same lookup rules, so a repeated lowercase request can resolve to that
+remaining uppercase entry.
+
 ### Vector index configuration updates
 
 Build, rebuild, and existing-table creation update the registry row selected by lookup, including

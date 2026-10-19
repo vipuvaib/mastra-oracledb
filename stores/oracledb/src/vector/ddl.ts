@@ -397,13 +397,10 @@ export class IndexRegistry {
         const tableName = qualifyName(registryRow.tableName, this.schemaName);
 
         await executeOracleDdl(connection, `DROP TABLE ${tableName} CASCADE CONSTRAINTS PURGE`, [-942]);
-        await connection.execute(
-          `DELETE FROM ${this.qualifiedRegistryTable()} WHERE index_name IN (:indexName, :legacyIndexName)`,
-          {
-            indexName: logicalIndexName,
-            legacyIndexName: safeLegacyCanonicalIndexName(logicalIndexName),
-          },
-        );
+        // The uppercase fallback can identify a separate index; delete only the resolved row.
+        await connection.execute(`DELETE FROM ${this.qualifiedRegistryTable()} WHERE index_name = :indexName`, {
+          indexName: registryRow.indexName,
+        });
         await connection.commit();
         this.clearIndexMetadata(logicalIndexName);
       }),

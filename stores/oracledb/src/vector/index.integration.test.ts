@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createVectorTestSuite } from '../../../_test-utils/src';
 import { OracleStore } from '../storage';
-import { tableNameForIndex } from './identifiers';
+import { qualifyName, tableNameForIndex } from './identifiers';
 import type { OracleVectorFilter } from './types';
 import { OracleVector } from '.';
 
@@ -1082,6 +1082,126 @@ describeIntegration('OracleVector registry configuration identity', () => {
           await writer.deleteIndex({ indexName: registeredName });
         } finally {
           await Promise.all([writer.disconnect(), reader.disconnect(), probe.disconnect()]);
+        }
+      }
+    },
+    60_000,
+  );
+});
+
+describeIntegration('OracleVector resolved-key deletion integration', () => {
+  const cases = [
+    { name: 'lowercase exact key', mixedCase: false, deleteUppercase: false, missingTable: false },
+    { name: 'mixed-case exact key', mixedCase: true, deleteUppercase: false, missingTable: false },
+    { name: 'exact key with an already-missing table', mixedCase: false, deleteUppercase: false, missingTable: true },
+    { name: 'uppercase exact key', mixedCase: false, deleteUppercase: true, missingTable: false },
+  ];
+
+  it.each(cases)(
+    'preserves the unrelated registry row and vectors when deleting $name',
+    async testCase => {
+      const suffix = randomUUID().replaceAll('-', '');
+      const exactName = `${testCase.mixedCase ? 'Case_Delete' : 'case_delete'}_${suffix}`;
+      const upperName = exactName.toUpperCase();
+      const registryTableName = 'ORACLE_IT_CASE_DELETE_REGISTRY';
+      const config = {
+        user: process.env.ORACLE_DATABASE_USER,
+        password: process.env.ORACLE_DATABASE_PASSWORD,
+        connectString: process.env.ORACLE_DATABASE_CONNECT_STRING,
+        registryTableName,
+        defaultIndexConfig: { type: 'none' as const },
+        defaultMetadataIndexes: [],
+      };
+      // Register distinct case-sensitive keys through supported public calls. The
+      // separate prefixes make their physical tables distinct in one shared registry.
+      const exactVector = new OracleVector({
+        ...config,
+        id: `case-exact-${suffix}`,
+        tablePrefix: 'ORACLE_IT_CASE_EXACT',
+      });
+      const upperVector = new OracleVector({
+        ...config,
+        id: `case-upper-${suffix}`,
+        tablePrefix: 'ORACLE_IT_CASE_UPPER',
+      });
+      const reader = new OracleVector({ ...config, id: `case-reader-${suffix}`, tablePrefix: 'ORACLE_IT_CASE_READER' });
+      const probe = new OracleStore({
+        id: `case-probe-${suffix}`,
+        user: config.user,
+        password: config.password,
+        connectString: config.connectString,
+        disableInit: true,
+      });
+      const exactTable = tableNameForIndex(exactName, 'ORACLE_IT_CASE_EXACT');
+      const upperTable = tableNameForIndex(upperName, 'ORACLE_IT_CASE_UPPER');
+      const created: { indexName: string; tableName: string }[] = [];
+      const survivor = testCase.deleteUppercase
+        ? { indexName: exactName, tableName: exactTable, id: 'exact-vector', queryVector: [1, 0, 0] }
+        : { indexName: upperName, tableName: upperTable, id: 'upper-vector', queryVector: [0, 1, 0] };
+      const target = testCase.deleteUppercase
+        ? { vector: upperVector, indexName: upperName, tableName: upperTable }
+        : { vector: exactVector, indexName: exactName, tableName: exactTable };
+      const registryRows = () =>
+        probe.db.execute<{ indexName: string; tableName: string }>(
+          `SELECT index_name AS "indexName", table_name AS "tableName" FROM ${qualifyName(registryTableName)}
+         WHERE index_name IN (:exactName, :upperName)`,
+          { exactName, upperName },
+        );
+
+      try {
+        await exactVector.createIndex({ indexName: exactName, dimension: 3, buildIndex: false });
+        created.push({ indexName: exactName, tableName: exactTable });
+        await upperVector.createIndex({ indexName: upperName, dimension: 3, buildIndex: false });
+        created.push({ indexName: upperName, tableName: upperTable });
+        await exactVector.upsert({ indexName: exactName, ids: ['exact-vector'], vectors: [[1, 0, 0]] });
+        await upperVector.upsert({ indexName: upperName, ids: ['upper-vector'], vectors: [[0, 1, 0]] });
+        expect(await registryRows()).toHaveLength(2);
+
+        if (testCase.missingTable) {
+          // This table was created by this fixture, not discovered from an arbitrary name.
+          await probe.db.executeDdl(`DROP TABLE ${qualifyName(target.tableName)} PURGE`);
+        }
+        await target.vector.deleteIndex({ indexName: target.indexName });
+
+        expect(await registryRows()).toEqual([{ indexName: survivor.indexName, tableName: survivor.tableName }]);
+        const tables = await probe.db.execute<{ tableName: string }>(
+          `SELECT table_name AS "tableName" FROM all_tables
+         WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AND table_name IN (:exactTable, :upperTable)`,
+          { exactTable, upperTable },
+        );
+        expect(tables).toEqual([{ tableName: survivor.tableName }]);
+        // This reader has not cached either index. The survivor must remain usable
+        // through its persisted registry entry, not merely through a writer's cache.
+        await expect(reader.describeIndex({ indexName: survivor.indexName })).resolves.toMatchObject({
+          indexName: survivor.indexName,
+          tableName: survivor.tableName,
+          count: 1,
+        });
+        await expect(
+          reader.query({
+            indexName: survivor.indexName,
+            queryVector: survivor.queryVector,
+            topK: 1,
+            queryMode: 'exact',
+          }),
+        ).resolves.toMatchObject([{ id: survivor.id }]);
+      } finally {
+        // Do not rely on the deletion method under test to clean up. A regression
+        // can orphan a table; remove only the exact UUID-owned objects we created.
+        try {
+          for (const entry of created.reverse()) {
+            await probe.db.executeDdl(`DROP TABLE ${qualifyName(entry.tableName)} PURGE`, [-942]);
+            await probe.db.none(`DELETE FROM ${qualifyName(registryTableName)} WHERE index_name = :indexName`, {
+              indexName: entry.indexName,
+            });
+          }
+        } finally {
+          await Promise.all([
+            exactVector.disconnect(),
+            upperVector.disconnect(),
+            reader.disconnect(),
+            probe.disconnect(),
+          ]);
         }
       }
     },
