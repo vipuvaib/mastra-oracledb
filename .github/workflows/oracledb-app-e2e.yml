@@ -1,0 +1,58 @@
+name: Oracle application E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Deterministic acceptance profile
+        type: choice
+        required: true
+        default: certification
+        options:
+          - certification
+          - e2e
+          - smoke
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-application-e2e
+  cancel-in-progress: false
+
+jobs:
+  deterministic:
+    runs-on: [self-hosted, linux, oracle-e2e]
+    environment: oracle-e2e
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
+        with:
+          run_install: false
+          cache: false
+      - uses: actions/setup-node@04be95cf3511ea51ebf9f224ddfb99cc7ab87cd4
+        with:
+          node-version: 22.23.2
+      - name: Install relevant workspace dependencies
+        run: pnpm install --frozen-lockfile --filter @internal/oracledb-app-e2e...
+      - name: Build application dependencies
+        run: pnpm turbo build --filter @mastra/oracledb --filter @mastra/memory --filter @mastra/client-js --filter @mastra/hono --filter @mastra/observability
+      - name: Check fixtures and run deterministic scenarios
+        working-directory: e2e-tests/oracledb-app
+        run: node --import tsx helpers/ci.ts "${{ inputs.profile }}"
+        env:
+          ORACLE_DATABASE_USER: ${{ secrets.ORACLE_APP_DATABASE_USER }}
+          ORACLE_DATABASE_PASSWORD: ${{ secrets.ORACLE_APP_DATABASE_PASSWORD }}
+          ORACLE_DATABASE_CONNECT_STRING: ${{ secrets.ORACLE_APP_DATABASE_CONNECT_STRING }}
+          ORACLE_APP_TEST_SCHEMA: ${{ secrets.ORACLE_APP_TEST_SCHEMA }}
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: oracle-application-e2e
+          path: e2e-tests/oracledb-app/artifacts/
+          if-no-files-found: warn
+          retention-days: 14

@@ -25,6 +25,7 @@ export async function query(
     sparseVector,
     queryMode,
     targetAccuracy,
+    neighborPartitionProbes,
   }: OracleQueryVectorParams,
 ): Promise<QueryResult[]> {
   try {
@@ -43,6 +44,17 @@ export async function query(
     if (targetAccuracy !== undefined) {
       validateAccuracy(targetAccuracy);
     }
+    if (neighborPartitionProbes !== undefined) {
+      if (!Number.isSafeInteger(neighborPartitionProbes) || neighborPartitionProbes <= 0) {
+        throw new Error('neighborPartitionProbes must be a positive safe integer');
+      }
+      if (targetAccuracy !== undefined) {
+        throw new Error('neighborPartitionProbes and targetAccuracy are mutually exclusive');
+      }
+      if (queryVector === undefined || (queryMode !== undefined && queryMode.toLowerCase() !== 'approx')) {
+        throw new Error('neighborPartitionProbes requires an approximate query with queryVector');
+      }
+    }
   } catch (error) {
     if (error instanceof MastraError) throw error;
     throw asMastraError('QUERY', 'INVALID_INPUT', { indexName }, error, ErrorCategory.USER);
@@ -50,6 +62,15 @@ export async function query(
 
   return withConnection(async connection => {
     const indexInfo = await registry.getIndexMetadata(connection, indexName);
+    if (neighborPartitionProbes !== undefined && indexInfo.indexType !== 'ivf') {
+      throw asMastraError(
+        'QUERY',
+        'INVALID_INPUT',
+        { indexName },
+        new Error('neighborPartitionProbes requires an IVF index'),
+        ErrorCategory.USER,
+      );
+    }
     if (queryVector !== undefined) {
       validateVectorForIndex(queryVector, indexInfo, indexName);
     }
@@ -79,7 +100,11 @@ export async function query(
     const fetchMode = normalizeQueryMode(queryMode ?? (indexInfo.indexType === 'none' ? 'exact' : 'approx'));
     // Oracle applies approximate index search only when ORDER BY and FETCH are in the same query block.
     const targetAccuracyClause =
-      fetchMode === 'approx' && targetAccuracy !== undefined ? ` WITH TARGET ACCURACY ${targetAccuracy}` : '';
+      neighborPartitionProbes !== undefined
+        ? ` WITH TARGET ACCURACY PARAMETERS (NEIGHBOR PARTITION PROBES ${neighborPartitionProbes})`
+        : fetchMode === 'approx' && targetAccuracy !== undefined
+          ? ` WITH TARGET ACCURACY ${targetAccuracy}`
+          : '';
     if (canSkipMinScoreFilter(indexInfo.metric, minScore)) {
       const sql = `
         SELECT

@@ -70,6 +70,12 @@ export interface OracleQueryVectorParams extends QueryVectorParams<OracleVectorF
   minScore?: number;
   queryMode?: OracleQueryMode;
   targetAccuracy?: number;
+  /**
+   * Maximum IVF partitions to probe. Must be a positive safe integer.
+   * Only supported for approximate vector queries on IVF indexes.
+   * Mutually exclusive with targetAccuracy.
+   */
+  neighborPartitionProbes?: number;
 }
 
 // Oracle returns storage details that Mastra's generic IndexStats does not currently model.

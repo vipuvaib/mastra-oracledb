@@ -8,6 +8,10 @@ Oracle Database provider for Mastra, providing storage and vector similarity sea
 npm install @mastra/oracledb
 ```
 
+The package installs the Oracle driver's type declarations as a production
+dependency. This provides the `Pool`, `Connection`, and related types used by
+`OracleConnectionConfig` and `OraclePoolManager`.
+
 ## Usage
 
 ### Storage
@@ -61,7 +65,7 @@ const { messages } = await memory.listMessages({ threadId: 'thread-123' });
 Message `include` context is selected by chronological `(createdAt, id)` order. When creation timestamps
 match, message IDs determine which neighbors precede or follow the requested anchor; insertion order
 is not used. Windows stay within the anchor's thread and honor the supplied resource filter, while
-cross-thread includes from the same resource remain supported. Final response sorting is unchanged.
+cross-thread includes from the same resource remain supported.
 
 ### Memory lifecycle responsibilities
 
@@ -158,12 +162,29 @@ use `$options`, for example `{ title: { $regex: '^oracle', $options: 'im' } }`. 
 Flags from a `RegExp` and `$options` are combined; the existing leading `(?i)` string form is also supported.
 Unsupported flags and `$options` without `$regex` throw an error. Patterns use Oracle's regex syntax.
 
-## Documentation
+## IVF query search budget
 
-- [Oracle Database integration guide](https://mastra.ai/integrations/databases/oracledb)
-- [Oracle Database vector reference](https://mastra.ai/reference/vectors/oracledb)
+For approximate IVF queries, `neighborPartitionProbes` sets the maximum number of
+centroid partitions to search. Use it instead of `targetAccuracy` when you need to
+control search breadth explicitly:
 
-### Vector memory (HNSW only)
+```typescript
+const matches = await vector.query({
+  indexName: 'documents',
+  queryVector: embedding,
+  topK: 10,
+  queryMode: 'approx',
+  neighborPartitionProbes: 6,
+});
+```
+
+The value must be a positive safe integer. It requires a query vector and an IVF
+index, and cannot be combined with `targetAccuracy` or exact search. Omitting it
+preserves the existing percentage accuracy behavior. More probes trade additional
+work for higher recall; calibrate the budget against exact search on your workload.
+See [Oracle's IVF search guidance](https://docs.oracle.com/en/database/oracle/oracle-database/26/vecse/understand-inverted-file-flat-vector-indexes.html).
+
+## Vector memory (HNSW only)
 
 Exact search is the default, and IVF indexes do not require Oracle's Vector Pool. HNSW indexes do require
 `VECTOR_MEMORY_SIZE` to be configured before they are built.
@@ -181,6 +202,14 @@ and uses `SCOPE=SPFILE`, so the restart is required. `vector.configureVectorMemo
 `ALTER SYSTEM` operation on its current connection (`MEMORY` by default); it does not switch to the CDB root,
 grant privileges, or restart the database. Use it only when the target Oracle deployment supports the requested
 scope through that connection.
+
+## Documentation
+
+- [Oracle Database integration guide](https://mastra.ai/integrations/databases/oracledb)
+- [Oracle Database vector reference](https://mastra.ai/reference/vectors/oracledb)
+- [Adapter development and regression tests](./DEVELOPMENT.md)
+- [Packed-package validation](./PACKAGING.md)
+- [Oracle application E2E tests](../../e2e-tests/oracledb-app/README.md)
 
 ## Changelog
 

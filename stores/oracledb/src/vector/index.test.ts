@@ -1158,3 +1158,84 @@ describe('OracleVector operation branches', () => {
     expect(connection.execute).toHaveBeenCalledWith('ALTER SYSTEM SET VECTOR_MEMORY_SIZE = 64M SCOPE=SPFILE');
   });
 });
+
+describe('OracleVector IVF query probes', () => {
+  it.each([-1, 0.5])('keeps the probe budget in the ranked query block with minScore %s', async minScore => {
+    const connection = {
+      execute: vi.fn(async (_sql: string) => ({
+        rows: [{ id: 'match', score: 0.9, metadata: { tenant: 'one' } }],
+      })),
+    };
+    const { vector } = createVectorWithConnection(connection);
+    cacheIndex(vector, { indexType: 'ivf' });
+
+    await expect(
+      vector.query({
+        indexName: 'hot_index',
+        queryVector: [1, 0, 0],
+        filter: { tenant: 'one' },
+        topK: 3,
+        minScore,
+        neighborPartitionProbes: 6,
+      }),
+    ).resolves.toEqual([{ id: 'match', score: 0.9, metadata: { tenant: 'one' } }]);
+
+    const sql = connection.execute.mock.calls[0]![0];
+    expect(sql).toMatch(
+      /ORDER BY VECTOR_DISTANCE\(embedding, :queryVector, COSINE\)\s+FETCH APPROX FIRST 3 ROWS ONLY WITH TARGET ACCURACY PARAMETERS \(NEIGHBOR PARTITION PROBES 6\)/,
+    );
+    expect(sql.includes('WITH vector_scores')).toBe(minScore > -1);
+    expect(connection.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '6) --'])(
+    'rejects an invalid probe budget %s before opening a connection',
+    async value => {
+      const { vector, poolManager } = createVectorWithConnection({});
+      await expect(
+        vector.query({
+          indexName: 'hot_index',
+          queryVector: [1, 0, 0],
+          neighborPartitionProbes: value as number,
+        }),
+      ).rejects.toThrow(/neighborPartitionProbes must be a positive safe integer/);
+      expect(poolManager.withConnection).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { queryVector: [1, 0, 0], targetAccuracy: 95 },
+    { queryVector: [1, 0, 0], queryMode: 'exact' as const },
+    { filter: { tenant: 'one' } },
+  ])('rejects conflicting or inapplicable probe options %j before opening a connection', async options => {
+    const { vector, poolManager } = createVectorWithConnection({});
+    await expect(vector.query({ indexName: 'hot_index', neighborPartitionProbes: 6, ...options })).rejects.toThrow(
+      /mutually exclusive|requires an approximate query with queryVector/,
+    );
+    expect(poolManager.withConnection).not.toHaveBeenCalled();
+  });
+
+  it.each(['hnsw', 'none'])('rejects probes on a %s index before executing search SQL', async indexType => {
+    const connection = { execute: vi.fn(async (_sql: string) => ({ rows: [] })) };
+    const { vector } = createVectorWithConnection(connection);
+    cacheIndex(vector, { indexType });
+    await expect(
+      vector.query({ indexName: 'hot_index', queryVector: [1, 0, 0], neighborPartitionProbes: 6 }),
+    ).rejects.toThrow(/neighborPartitionProbes requires an IVF index/);
+    expect(connection.execute).not.toHaveBeenCalled();
+  });
+
+  it('preserves percentage accuracy when explicit probes are omitted', async () => {
+    const connection = { execute: vi.fn(async (_sql: string) => ({ rows: [] })) };
+    const { vector } = createVectorWithConnection(connection);
+    cacheIndex(vector, { indexType: 'ivf' });
+    await vector.query({
+      indexName: 'hot_index',
+      queryVector: [1, 0, 0],
+      queryMode: 'approx',
+      targetAccuracy: 95,
+    });
+    expect(connection.execute.mock.calls[0]![0]).toContain('FETCH APPROX FIRST 10 ROWS ONLY WITH TARGET ACCURACY 95');
+    expect(connection.execute.mock.calls[0]![0]).not.toContain('NEIGHBOR PARTITION PROBES');
+  });
+});

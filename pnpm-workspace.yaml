@@ -32,6 +32,7 @@ packages:
   - e2e-tests/client-js/zod-v3
   - e2e-tests/client-js/zod-v4
   - e2e-tests/workspace-compat
+  - e2e-tests/oracledb-app
 
 # Share pnpm's virtual store across git worktrees: https://pnpm.io/git-worktrees
 enableGlobalVirtualStore: true

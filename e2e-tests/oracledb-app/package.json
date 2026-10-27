@@ -1,0 +1,44 @@
+{
+  "name": "@internal/oracledb-app-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:preflight": "tsx helpers/preflight.ts",
+    "test:smoke": "tsx helpers/run-tests.ts smoke",
+    "test:e2e": "tsx helpers/run-tests.ts e2e",
+    "test:harness": "vitest run --config vitest.harness.config.ts",
+    "test:cleanup": "tsx helpers/cleanup.ts",
+    "test:live": "tsx helpers/run-tests.ts live",
+    "test:ci": "tsx helpers/ci.ts",
+    "test:package": "tsx helpers/package-check.ts",
+    "test:certification": "tsx helpers/run-tests.ts certification",
+    "test:package:oracle": "tsx helpers/package-check.ts --oracle",
+    "test:package:compiled": "tsx helpers/package-check.ts --compiled",
+    "test:delivery": "tsx helpers/delivery-check.ts",
+    "test:upgrade": "tsx helpers/upgrade-check.ts",
+    "test:restart": "tsx helpers/restart-check.ts",
+    "test:repeat": "tsx helpers/repeat-certification.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/provider-v5": "npm:@ai-sdk/provider@2.0.3",
+    "@hono/node-server": "^2.0.8",
+    "@mastra/client-js": "workspace:*",
+    "@mastra/core": "workspace:*",
+    "@mastra/hono": "workspace:*",
+    "@mastra/memory": "workspace:*",
+    "@mastra/observability": "workspace:*",
+    "@mastra/oracledb": "workspace:*",
+    "hono": "^4.13.7",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@mastra/schema-compat": "workspace:*",
+    "@mastra/server": "workspace:*",
+    "@types/node": "22.20.1",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

@@ -1,0 +1,34 @@
+import { OraclePoolManager, OracleStore, OracleVector } from '@mastra/oracledb';
+import type { OracleConnectionConfig, OracleQueryVectorParams } from '@mastra/oracledb';
+import type { MastraCompositeStore } from '@mastra/core/storage';
+import type { MastraVector } from '@mastra/core/vector';
+
+type RequireTrue<T extends true> = T;
+type IsTyped<T> = 0 extends 1 & T ? false : true;
+export type DriverPool = NonNullable<OracleConnectionConfig['pool']>;
+export type DriverConnection = Awaited<ReturnType<DriverPool['getConnection']>>;
+export type PoolHasTypes = RequireTrue<IsTyped<DriverPool>>;
+export type PoolPropertyHasTypes = RequireTrue<IsTyped<DriverPool['connectionsOpen']>>;
+export type ConnectionHasTypes = RequireTrue<IsTyped<DriverConnection>>;
+export type ManagedPoolHasTypes = RequireTrue<IsTyped<Awaited<ReturnType<OraclePoolManager['getPool']>>>>;
+
+export function publicUsage(pool: DriverPool) {
+  const config: OracleConnectionConfig = { pool };
+  const store: MastraCompositeStore = new OracleStore({ id: 'consumer-store', ...config, disableInit: true });
+  const vector: MastraVector = new OracleVector({ id: 'consumer-vector', ...config });
+  const manager = new OraclePoolManager(config);
+  const acquired: Promise<DriverPool> = manager.getPool();
+  const result: Promise<number> = manager.withConnection(async connection => {
+    connection.callTimeout = 1000;
+    const rows = await connection.execute<{ value: number }>('SELECT 1 AS "value" FROM dual');
+    return rows.rows?.[0]?.value ?? 0;
+  });
+  const query: OracleQueryVectorParams = { indexName: 'consumer', queryVector: [1, 0, 0], topK: 1, queryMode: 'exact' };
+  const ivfQuery: OracleQueryVectorParams = {
+    indexName: 'consumer-ivf',
+    queryVector: [1, 0, 0],
+    queryMode: 'approx',
+    neighborPartitionProbes: 6,
+  };
+  return { store, vector, acquired, result, query, ivfQuery };
+}
