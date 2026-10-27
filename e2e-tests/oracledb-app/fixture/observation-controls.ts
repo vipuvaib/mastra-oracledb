@@ -1,6 +1,8 @@
 import type { MastraCompositeStore, ObservationalMemoryRecord } from '@mastra/core/storage';
 import type { Memory } from '@mastra/memory';
 
+type LateBuffer = () => Promise<{ buffered: boolean; pid: number }>;
+
 /** Test-only scheduling boundaries; all observation and Oracle writes stay real. */
 export async function observationControls(memory: Memory, storage: MastraCompositeStore) {
   const store = (await storage.getStore('memory'))!;
@@ -8,12 +10,14 @@ export async function observationControls(memory: Memory, storage: MastraComposi
   const append = store.appendBufferedObservations.bind(store);
   const swap = store.swapBufferedToActive.bind(store);
   let ackTarget: string | undefined;
-  let lateTarget: { threadId: string; resourceId: string } | undefined;
+  let lateTarget: { threadId: string; resourceId: string; buffer: LateBuffer } | undefined;
   const probe = {
     appendAttempts: [] as { recordId: string; cycleId: string }[],
     postCommitFailures: 0,
     committedChunkIds: [] as string[],
     race: null as null | {
+      activationPid: number;
+      observerPid: number;
       callerChunkIds: string[];
       lockedChunkIds: string[];
       firstCycleId: string;
@@ -43,8 +47,10 @@ export async function observationControls(memory: Memory, storage: MastraComposi
       lateTarget = undefined;
       const first = input.bufferedChunks?.[0];
       if (!first) throw new Error('Activation race requires the original buffered chunk.');
-      // Append the second real observer cycle after activate() captured its chunk snapshot.
-      const buffered = await engine.buffer({ ...target, skipMinimumTokenCheck: true });
+      // activate() owns this process's commit slot. A separate process commits the late
+      // real observer cycle after that snapshot, before the Oracle row-locking swap.
+      const buffered = await target.buffer();
+      if (buffered.pid === process.pid) throw new Error('The late observer must run in another process.');
       if (!buffered.buffered) throw new Error('The late real observation cycle did not buffer.');
       const fresh = (await engine.getRecord(target.threadId, target.resourceId))!;
       const chunks = fresh.bufferedObservationChunks ?? [];
@@ -57,6 +63,8 @@ export async function observationControls(memory: Memory, storage: MastraComposi
       // Model another pending-token writer, using real committed Oracle storage.
       await store.setPendingMessageTokens(input.id, lockedPending);
       probe.race = {
+        activationPid: process.pid,
+        observerPid: buffered.pid,
         callerChunkIds: input.bufferedChunks!.map(chunk => chunk.id),
         lockedChunkIds: chunks.map(chunk => chunk.id),
         firstCycleId: first.cycleId,
@@ -88,11 +96,15 @@ export async function observationControls(memory: Memory, storage: MastraComposi
       await memory.settled();
       return { buffered: result.buffered, record: await engine.getRecord(threadId, resourceId), probe };
     },
-    async activate(threadId: string, resourceId: string, appendDuringActivation: boolean) {
-      if (appendDuringActivation) lateTarget = { threadId, resourceId };
-      const result = await engine.activate({ threadId, resourceId });
-      await memory.settled();
-      return { activated: result.activated, record: await engine.getRecord(threadId, resourceId), probe };
+    async activate(threadId: string, resourceId: string, bufferLate?: LateBuffer) {
+      if (bufferLate) lateTarget = { threadId, resourceId, buffer: bufferLate };
+      try {
+        const result = await engine.activate({ threadId, resourceId });
+        await memory.settled();
+        return { activated: result.activated, record: await engine.getRecord(threadId, resourceId), probe };
+      } finally {
+        lateTarget = undefined;
+      }
     },
     async record(threadId: string, resourceId: string): Promise<ObservationalMemoryRecord | null> {
       return store.getObservationalMemory(threadId, resourceId);

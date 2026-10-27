@@ -3,6 +3,7 @@ import { expect, it } from 'vitest';
 import { z } from 'zod';
 import { recordEvidence } from '../helpers/evidence.ts';
 import { testOperation } from '../helpers/http.ts';
+import { ServerProcess } from '../helpers/server-process.ts';
 import { suite } from '../helpers/suite.ts';
 
 const { server, store } = suite('patch-observations');
@@ -33,6 +34,8 @@ const responseSchema = z.object({
     committedChunkIds: z.array(z.string()),
     race: z
       .object({
+        activationPid: z.number().int().positive(),
+        observerPid: z.number().int().positive(),
         callerChunkIds: z.array(z.string()),
         lockedChunkIds: z.array(z.string()),
         firstCycleId: z.string(),
@@ -70,11 +73,28 @@ it('D04 retries a committed real observation once and preserves late chunks and 
   expect(first[0]!.messageIds.every(id => persisted.messages.some(message => message.id === id))).toBe(true);
   await server.client.getAgent('observed').generate('OBSERVE CODE: ' + secondCode, options);
   await server.settle();
-  const activated = responseSchema.parse(
-    await testOperation(server, 'observations/activate', { threadId, resourceId, inject: true }),
-  );
+  const observer = new ServerProcess('patch-observations-peer');
+  let activated: z.infer<typeof responseSchema>;
+  let observerPid: number;
+  try {
+    await observer.start();
+    observerPid = observer.child!.pid!;
+    activated = responseSchema.parse(
+      await testOperation(server, 'observations/activate', {
+        threadId,
+        resourceId,
+        inject: true,
+        observerPort: Number(new URL(observer.baseUrl).port),
+      }),
+    );
+  } finally {
+    await observer.stop();
+  }
   expect(activated.activated).toBe(true);
   const race = activated.probe.race!;
+  expect(race.activationPid).toBe(server.child!.pid);
+  expect(race.observerPid).toBe(observerPid);
+  expect(race.observerPid).not.toBe(race.activationPid);
   expect(race.callerChunkIds).toEqual([first[0]!.id]);
   expect(race.lockedChunkIds).toHaveLength(2);
   expect(activated.record.bufferedObservationChunks).toHaveLength(1);
@@ -119,6 +139,7 @@ it('D04 retries a committed real observation once and preserves late chunks and 
     appendAttempts: activated.probe.appendAttempts,
     postCommitFailures: buffered.probe.postCommitFailures,
     race,
+    processBoundary: 'separate observer process commits after activation snapshot and before Oracle swap',
     finalPendingTokens: finished.record.pendingMessageTokens,
     observationTokens: finished.record.observationTokenCount,
   });

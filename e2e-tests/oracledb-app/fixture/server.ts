@@ -28,11 +28,42 @@ const observationInput = z.object({
   resourceId: z.string().uuid(),
   inject: z.boolean().default(false),
 });
+const activationInput = observationInput
+  .extend({ observerPort: z.number().int().min(1).max(65535).optional() })
+  .refine(input => !input.inject || input.observerPort !== undefined, {
+    message: 'Injected activation requires a separate loopback observer process.',
+    path: ['observerPort'],
+  });
 app.post('/_test/observations/:operation', async c => {
-  const { threadId, resourceId, inject } = observationInput.parse(await c.req.json());
+  const body = await c.req.json();
   const operation = c.req.param('operation');
+  if (operation === 'activate') {
+    const { threadId, resourceId, inject, observerPort } = activationInput.parse(body);
+    const bufferLate = inject
+      ? async () => {
+          const origin = 'http://127.0.0.1:' + observerPort;
+          const ready = await fetch(origin + '/_test/ready', { signal: AbortSignal.timeout(5000) });
+          if (!ready.ok) throw new Error('The late observer is not ready.');
+          const peer = z
+            .object({ pid: z.number().int().positive(), runId: z.string().uuid() })
+            .parse(await ready.json());
+          if (peer.runId !== process.env.ORACLE_APP_RUN_ID || peer.pid === process.pid)
+            throw new Error('The late observer must be a separate process on the same test lease.');
+          const response = await fetch(origin + '/_test/observations/buffer', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ threadId, resourceId, inject: false }),
+            signal: AbortSignal.timeout(30_000),
+          });
+          if (!response.ok) throw new Error('The late observer buffer failed: ' + (await response.text()));
+          const result = z.object({ buffered: z.boolean() }).parse(await response.json());
+          return { buffered: result.buffered, pid: peer.pid };
+        }
+      : undefined;
+    return c.json(await fixture.observation.activate(threadId, resourceId, bufferLate));
+  }
+  const { threadId, resourceId, inject } = observationInput.parse(body);
   if (operation === 'buffer') return c.json(await fixture.observation.buffer(threadId, resourceId, inject));
-  if (operation === 'activate') return c.json(await fixture.observation.activate(threadId, resourceId, inject));
   if (operation === 'record') return c.json({ record: await fixture.observation.record(threadId, resourceId) });
   return c.json({ error: 'Unknown operation' }, 400);
 });

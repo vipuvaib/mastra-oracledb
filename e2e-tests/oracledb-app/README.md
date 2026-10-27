@@ -190,10 +190,12 @@ The fixture's loopback-only routes call the actual Memory engine and Oracle
 adapter. They expose test controls rather than production API endpoints.
 
 D04 injects a lost acknowledgment after a real observational-memory append commits.
-The actual retry must preserve one chunk/cycle. A second observation is appended
-after activation captures its snapshot; a concurrent pending-token increment and
-late chunk must survive partial activation and restart. Thread-scoped deletion
-must preserve another thread's observations.
+The actual retry must preserve one chunk/cycle. A second fixture process on the same
+lease appends a real observation after activation captures its snapshot and before
+the Oracle swap. Awaited loopback HTTP orders that commit without re-entering the
+activation process's Memory queue. Recorded process IDs must differ. A concurrent
+pending-token increment and late chunk must survive partial activation and restart.
+Thread-scoped deletion must preserve another thread's observations.
 
 D05 injects a vector migration failure after storage ownership commits. The test
 requires both the HTTP failure and committed storage state, then checks that a
