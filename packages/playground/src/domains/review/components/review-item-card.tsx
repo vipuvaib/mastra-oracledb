@@ -1,38 +1,19 @@
-import type { DatasetExperimentResult } from '@mastra/client-js';
 import { Badge } from '@mastra/playground-ui/components/Badge';
 import { Button } from '@mastra/playground-ui/components/Button';
+import { Code } from '@mastra/playground-ui/components/Code';
+import { CodeEditor } from '@mastra/playground-ui/components/CodeEditor';
 import { Textarea } from '@mastra/playground-ui/components/Textarea';
 import { TooltipProvider } from '@mastra/playground-ui/components/Tooltip';
 import { Txt } from '@mastra/playground-ui/components/Txt';
 import { Icon } from '@mastra/playground-ui/icons/Icon';
 import { cn } from '@mastra/playground-ui/utils/cn';
+import type { ReviewItem } from '@mastra/react/hooks/review';
 import { ThumbsUp, ThumbsDown, Trash2, CheckCircle, GaugeIcon } from 'lucide-react';
 import { useState } from 'react';
 import { TagPicker } from './tag-picker';
 import { ComputedTag } from '@/domains/observability/components/computed-tag';
 
-export interface ReviewItem {
-  id: string;
-  input: unknown;
-  output: unknown;
-  error: unknown;
-  itemId: string;
-  datasetId?: string;
-  scores?: Record<string, number>;
-  tags: string[];
-  rating?: 'positive' | 'negative';
-  comment?: string;
-  clusterId?: string;
-  experimentId?: string;
-  traceId?: string;
-  createdAt?: DatasetExperimentResult['createdAt'];
-  status?: DatasetExperimentResult['status'];
-  groundTruth?: unknown;
-  toolMockReport?: DatasetExperimentResult['toolMockReport'];
-}
-
 function formatUnknown(value: unknown): string {
-  if (typeof value === 'string') return value;
   try {
     return JSON.stringify(value, null, 2);
   } catch {
@@ -40,10 +21,30 @@ function formatUnknown(value: unknown): string {
   }
 }
 
+/** Strings stay plain text; anything else is shown as foldable JSON. */
+function ReviewPayload({ value, label, className }: { value: unknown; label: string; className: string }) {
+  const frame = 'overflow-auto rounded bg-background p-2';
+  if (typeof value === 'string') {
+    return <Code className={cn(frame, 'text-caption whitespace-pre-wrap', className)} code={value} />;
+  }
+  return (
+    <CodeEditor
+      value={formatUnknown(value)}
+      language="json"
+      editable={false}
+      lineNumbers={false}
+      showCopyButton={false}
+      variant="embedded"
+      aria-label={label}
+      className={cn(frame, className)}
+    />
+  );
+}
+
 function getScoreBadgeVariant(score: number) {
-  if (score >= 0.7) return 'green';
-  if (score >= 0.4) return 'yellow';
-  return 'red';
+  if (score >= 0.7) return 'success';
+  if (score >= 0.4) return 'warning';
+  return 'destructive';
 }
 
 export function ReviewItemCard({
@@ -89,14 +90,14 @@ export function ReviewItemCard({
     <div
       className={cn(
         'rounded-lg border border-border p-3 transition-colors',
-        isSelected && 'ring-1 ring-accent1',
-        item.tags.length > 0 && 'border-l-2 border-l-accent1',
+        isSelected && 'ring-1 ring-foreground',
+        item.tags.length > 0 && 'border-l-2 border-l-border-strong',
       )}
     >
       {/* Header row */}
       <div className="flex items-center gap-2">
         {isCompleted ? (
-          <Icon size="xs" className="shrink-0 text-positive1">
+          <Icon size="xs" className="shrink-0 text-success-indicator">
             <CheckCircle />
           </Icon>
         ) : (
@@ -104,7 +105,7 @@ export function ReviewItemCard({
             type="checkbox"
             checked={isSelected}
             onChange={onToggleSelect}
-            className="h-3.5 w-3.5 rounded border-border accent-accent1"
+            className="h-3.5 w-3.5 rounded border-border accent-success-indicator"
           />
         )}
         <button type="button" onClick={onToggleExpand} className="min-w-0 flex-1 text-left">
@@ -116,7 +117,7 @@ export function ReviewItemCard({
 
       {/* Error indicator */}
       {Boolean(item.error) && (
-        <Txt variant="meta" className="mt-1 block truncate text-negative1">
+        <Txt variant="meta" className="mt-1 block truncate text-destructive-foreground">
           Error: {typeof item.error === 'string' ? item.error : String(item.error)}
         </Txt>
       )}
@@ -129,11 +130,11 @@ export function ReviewItemCard({
             <Button
               tooltip="Good — this result is acceptable"
               variant={item.rating === 'positive' ? 'default' : 'ghost'}
-              size="sm"
+              size="icon-sm"
               onClick={() => onRate(item.rating === 'positive' ? undefined : 'positive')}
               disabled={isCompleted}
             >
-              <Icon size="xs" className={item.rating === 'positive' ? 'text-positive1' : ''}>
+              <Icon size="xs" className={item.rating === 'positive' ? 'text-success-indicator' : ''}>
                 <ThumbsUp />
               </Icon>
             </Button>
@@ -141,11 +142,11 @@ export function ReviewItemCard({
             <Button
               tooltip="Bad — this result needs fixing"
               variant={item.rating === 'negative' ? 'default' : 'ghost'}
-              size="sm"
+              size="icon-sm"
               onClick={() => onRate(item.rating === 'negative' ? undefined : 'negative')}
               disabled={isCompleted}
             >
-              <Icon size="xs" className={item.rating === 'negative' ? 'text-negative1' : ''}>
+              <Icon size="xs" className={item.rating === 'negative' ? 'text-destructive-foreground' : ''}>
                 <ThumbsDown />
               </Icon>
             </Button>
@@ -187,14 +188,14 @@ export function ReviewItemCard({
           {!isCompleted && (
             <div className="flex items-center gap-0.5">
               {onComplete && (
-                <Button tooltip="Mark as complete" variant="ghost" size="sm" onClick={onComplete}>
-                  <Icon size="xs" className="text-positive1">
+                <Button tooltip="Mark as complete" variant="ghost" size="icon-sm" onClick={onComplete}>
+                  <Icon size="xs" className="text-success-indicator">
                     <CheckCircle />
                   </Icon>
                 </Button>
               )}
-              <Button tooltip="Remove from review" variant="ghost" size="sm" onClick={onRemove}>
-                <Icon size="xs" className="text-placeholder hover:text-negative1">
+              <Button tooltip="Remove from review" variant="ghost" size="icon-sm" onClick={onRemove}>
+                <Icon size="xs" className="text-placeholder hover:text-destructive-foreground">
                   <Trash2 />
                 </Icon>
               </Button>
@@ -211,27 +212,23 @@ export function ReviewItemCard({
               <Txt variant="meta" tone="muted">
                 Experiment:
               </Txt>
-              <code className="rounded bg-background px-1.5 py-0.5 font-mono text-meta text-muted-foreground">
+              <Txt as="span" variant="meta" tone="muted" font="mono">
                 {item.experimentId.slice(0, 8)}
-              </code>
+              </Txt>
             </div>
           )}
           <div>
             <Txt variant="meta" tone="muted" className="mb-1 block">
               Input
             </Txt>
-            <pre className="max-h-40 overflow-auto rounded bg-background p-2 text-caption whitespace-pre-wrap text-foreground">
-              {formatUnknown(item.input)}
-            </pre>
+            <ReviewPayload value={item.input} label="Input" className="max-h-40 text-foreground" />
           </div>
           {item.output !== undefined && item.output !== null && (
             <div>
               <Txt variant="meta" tone="muted" className="mb-1 block">
                 Output
               </Txt>
-              <pre className="max-h-40 overflow-auto rounded bg-background p-2 text-caption whitespace-pre-wrap text-foreground">
-                {formatUnknown(item.output)}
-              </pre>
+              <ReviewPayload value={item.output} label="Output" className="max-h-40 text-foreground" />
             </div>
           )}
           {Boolean(item.error) && (
@@ -239,9 +236,7 @@ export function ReviewItemCard({
               <Txt variant="meta" tone="muted" className="mb-1 block">
                 Error
               </Txt>
-              <pre className="max-h-20 overflow-auto rounded bg-background p-2 text-caption whitespace-pre-wrap text-negative1">
-                {formatUnknown(item.error)}
-              </pre>
+              <ReviewPayload value={item.error} label="Error" className="max-h-20 text-destructive-foreground" />
             </div>
           )}
           {/* Comment */}
@@ -251,6 +246,7 @@ export function ReviewItemCard({
                 Comment
               </Txt>
               <Textarea
+                className="text-caption"
                 value={localComment}
                 onChange={e => {
                   setLocalComment(e.target.value);
@@ -265,10 +261,9 @@ export function ReviewItemCard({
                 }}
                 placeholder="Add a note about this item..."
                 rows={2}
-                className="text-caption"
               />
               {commentSaved && (
-                <Txt variant="meta" className="mt-0.5 text-positive1">
+                <Txt variant="meta" className="mt-0.5 text-success-indicator">
                   Saved
                 </Txt>
               )}

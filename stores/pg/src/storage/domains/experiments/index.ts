@@ -36,6 +36,7 @@ import type {
   RetentionTablesDescriptor,
   TableRetentionPolicy,
 } from '@mastra/core/storage';
+import { schemaNamePrefix } from '../../../shared/schema-name';
 import type { TxClient } from '../../client';
 import { PgDB, resolvePgConfig, generateTableSQL } from '../../db';
 import type { DbClient, PgDomainConfig } from '../../db';
@@ -109,6 +110,9 @@ export class ExperimentsPG extends ExperimentsStorage {
         'scorerIds',
       ],
     });
+    // Tables created before targetType/targetId became nullable keep NOT NULL,
+    // which breaks caller-driven experiments.
+    await this.#db.dropNotNull({ tableName: TABLE_EXPERIMENTS, columns: ['targetType', 'targetId'] });
     await this.#db.alterTable({
       tableName: TABLE_EXPERIMENT_RESULTS,
       schema: EXPERIMENT_RESULTS_SCHEMA,
@@ -137,7 +141,7 @@ export class ExperimentsPG extends ExperimentsStorage {
    * so its supporting index is not part of the default index set.
    */
   private async ensureRetentionIndexes(policies: Record<string, TableRetentionPolicy>): Promise<void> {
-    const prefix = this.#schema !== 'public' ? `${this.#schema}_` : '';
+    const prefix = this.#schema !== 'public' ? `${schemaNamePrefix(this.#schema)}_` : '';
     for (const [key, entry] of Object.entries(ExperimentsPG.retentionTables)) {
       if (!entry.indexed || !policies[key]) continue;
       try {

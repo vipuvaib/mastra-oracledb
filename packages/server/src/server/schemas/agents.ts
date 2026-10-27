@@ -157,6 +157,10 @@ export const toolIdPathParams = z.object({
   toolId: z.string().describe('Unique identifier for the tool'),
 });
 
+export const agentRunPathParams = agentIdPathParams.extend({
+  runId: z.string().min(1).describe('Unique identifier for the agent run'),
+});
+
 export const agentToolPathParams = agentIdPathParams.extend({
   toolId: z.string().describe('Unique identifier for the tool'),
 });
@@ -279,6 +283,10 @@ export const serializedAgentSchema = z.object({
   modelVersion: z.string().optional(),
   supportsMemory: z.boolean().optional(),
   modelList: z.array(modelConfigSchema).optional(),
+  modelListEditable: z
+    .boolean()
+    .optional()
+    .describe('False when the model list comes from a function and cannot be reordered or edited'),
   defaultOptions: defaultOptionsSchema.optional(),
   defaultGenerateOptionsLegacy: z.record(z.string(), z.unknown()).optional(),
   defaultStreamOptionsLegacy: z.record(z.string(), z.unknown()).optional(),
@@ -309,6 +317,7 @@ export const providerSchema = z.object({
   connected: z.boolean(),
   docUrl: z.string().optional(),
   models: z.array(z.string()),
+  modelReleaseDates: z.record(z.string(), z.string()).optional(),
 });
 
 /**
@@ -518,6 +527,10 @@ const toolCallActionBodySchema = z.object({
   requestContext: z.record(z.string(), z.unknown()).optional(),
   toolCallId: z.string(),
   format: z.string().optional(),
+  providerOptions: z.record(z.string(), z.record(z.string(), jsonValueSchema)).optional(),
+  modelSettings: typedPermissive<ModelSettings>(z.unknown()).optional(),
+  // Client tools must be re-sent on resume so the model can call them after the approval decision.
+  clientTools: typedPermissive<ToolsInput>(z.record(z.string(), z.unknown())).optional(),
 });
 const networkToolCallActionBodySchema = z.object({
   runId: z.string(),
@@ -773,19 +786,27 @@ export const sendAgentMessageBodySchema = z.union([
 ]);
 
 export const queueAgentMessageBodySchema = sendAgentMessageBodySchema;
+export const queueAgentSignalBodySchema = sendAgentSignalBodySchema;
 
-export const subscribeAgentThreadBodySchema = z.object({
+const agentThreadBodySchema = z.object({
   resourceId: z.string().optional(),
   threadId: z.string(),
 });
 
-export const abortAgentThreadBodySchema = subscribeAgentThreadBodySchema.extend({
+export const subscribeAgentThreadBodySchema = agentThreadBodySchema.extend({
+  withInitialHistory: z
+    .union([z.boolean(), z.object({ perPage: z.number().int().positive().optional() })])
+    .optional()
+    .describe('Emit one thread-history chunk with stored messages before live parts'),
+});
+
+export const abortAgentThreadBodySchema = agentThreadBodySchema.extend({
   threadId: z.string().min(1),
   clearPendingSignals: z.boolean().optional(),
   expectedRunId: z.string().optional(),
 });
 
-export const cancelPendingAgentSignalsBodySchema = subscribeAgentThreadBodySchema.extend({
+export const cancelPendingAgentSignalsBodySchema = agentThreadBodySchema.extend({
   threadId: z.string().min(1),
   signalIds: z.array(z.string().min(1)).min(1).max(1000),
 });

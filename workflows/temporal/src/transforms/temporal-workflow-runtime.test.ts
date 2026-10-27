@@ -109,6 +109,26 @@ describe('temporal workflow runtime helper module', () => {
     await expect(workflow({ inputData: { value: 21 } })).rejects.toBe(error);
   });
 
+  it.each([1, 5, 0])('forwards an activity retry policy with maximumAttempts %s', async maximumAttempts => {
+    const retry = {
+      initialInterval: '5 seconds',
+      backoffCoefficient: 2,
+      maximumInterval: '5 minutes',
+      maximumAttempts,
+      nonRetryableErrorTypes: ['ValidationError'],
+    };
+    const failure = new Error('permanent failure');
+    const failingStep = vi.fn().mockRejectedValue(failure);
+    proxyActivities.mockReturnValue({ failing: failingStep });
+
+    const { createWorkflow } = await import('./temporal-workflow-runtime.mjs');
+    const workflow = createWorkflow('failing-workflow', { retry }).then('failing').commit();
+
+    await expect(workflow({ inputData: {} })).rejects.toBe(failure);
+    expect(proxyActivities).toHaveBeenCalledWith({ startToCloseTimeout: '1 minute', retry });
+    expect(failingStep).toHaveBeenCalledTimes(1);
+  });
+
   it('uses the configured activity timeout', async () => {
     proxyActivities.mockReturnValue({});
 
@@ -124,7 +144,7 @@ describe('temporal workflow runtime helper module', () => {
     executeChild.mockResolvedValue({ result: { city: 'SF', child: true } });
 
     const { createWorkflow } = await import('./temporal-workflow-runtime.mjs');
-    const workflow = createWorkflow('weather-workflow').thenWorkflow('childWorkflow').commit();
+    const workflow = createWorkflow('weather-workflow').thenWorkflow('childWorkflow', 'child').commit();
     const result = await workflow({
       inputData: { city: 'SF' },
       requestContext: { tenantId: 'tenant-1' },
@@ -149,7 +169,7 @@ describe('temporal workflow runtime helper module', () => {
       result: { city: 'SF', child: true },
       state: undefined,
       steps: {
-        childWorkflow: { city: 'SF', child: true },
+        child: { city: 'SF', child: true },
       },
     });
   });
@@ -212,7 +232,7 @@ describe('temporal workflow runtime helper module', () => {
 
     const { createWorkflow } = await import('./temporal-workflow-runtime.mjs');
     const workflow = createWorkflow('parallel-child-workflow')
-      .parallel([{ type: 'childWorkflow', workflowType: 'childWorkflow' }])
+      .parallel([{ type: 'childWorkflow', workflowType: 'childWorkflow', id: 'child' }])
       .commit();
     const result = await workflow({ inputData: { value: 'parent-input' } });
 
@@ -227,7 +247,7 @@ describe('temporal workflow runtime helper module', () => {
       },
       state: undefined,
       steps: {
-        childWorkflow: { value: 'child-output' },
+        child: { value: 'child-output' },
       },
     });
   });
@@ -241,7 +261,7 @@ describe('temporal workflow runtime helper module', () => {
     const workflow = createWorkflow('mixed-parallel-workflow')
       .parallel([
         { type: 'step', step: { id: 'activity' } },
-        { type: 'childWorkflow', workflowType: 'childWorkflow' },
+        { type: 'childWorkflow', workflowType: 'childWorkflow', id: 'child' },
       ])
       .commit();
     const result = await workflow({ inputData: { value: 'parent-input' } });
@@ -261,7 +281,7 @@ describe('temporal workflow runtime helper module', () => {
       },
       steps: {
         activity: { value: 'parent-input-activity' },
-        childWorkflow: { value: 'child-output' },
+        child: { value: 'child-output' },
       },
     });
   });
@@ -423,5 +443,54 @@ describe('temporal workflow runtime helper module', () => {
     expect(continueWhile).toHaveBeenCalledTimes(2);
     expect(incrementUntil).toHaveBeenCalledTimes(2);
     expect(stopUntil).toHaveBeenCalledTimes(2);
+  });
+
+  it('records step start and end times only when the start input asks for them', async () => {
+    vi.useFakeTimers({ now: 1_000 });
+    try {
+      const fetchWeather = vi.fn(async () => {
+        vi.setSystemTime(1_250);
+        return { weather: 'sunny' };
+      });
+      const noOutput = vi.fn(async () => {
+        vi.setSystemTime(1_300);
+        return undefined;
+      });
+      proxyActivities.mockReturnValue({ 'fetch-weather': fetchWeather, 'no-output': noOutput });
+
+      const { createWorkflow } = await import('./temporal-workflow-runtime.mjs');
+      const workflow = createWorkflow('weather-workflow').then('fetch-weather').then('no-output').commit();
+
+      const plain = await workflow({ inputData: { city: 'SF' } });
+      expect(plain).not.toHaveProperty('stepMeta');
+
+      vi.setSystemTime(1_000);
+      const timed = await workflow({ inputData: { city: 'SF' }, recordStepMeta: true });
+      expect(timed.steps).toEqual({ 'fetch-weather': { weather: 'sunny' }, 'no-output': undefined });
+      expect(timed.stepMeta).toEqual({
+        'fetch-weather': { startedAt: 1_000, endedAt: 1_250 },
+        'no-output': { startedAt: 1_250, endedAt: 1_300 },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keys child workflow records by the Mastra workflow id and parallel output by the Temporal type', async () => {
+    executeChild.mockResolvedValue({ result: { child: true } });
+    proxyActivities.mockReturnValue({});
+
+    const { createWorkflow } = await import('./temporal-workflow-runtime.mjs');
+    const workflow = createWorkflow('parent-workflow')
+      .thenWorkflow('childWorkflow', 'child')
+      .parallel([{ type: 'childWorkflow', workflowType: 'otherWorkflow', id: 'other' }])
+      .commit();
+    const result = await workflow({ inputData: {}, recordStepMeta: true });
+
+    expect(executeChild).toHaveBeenCalledWith('childWorkflow', expect.anything());
+    expect(executeChild).toHaveBeenCalledWith('otherWorkflow', expect.anything());
+    expect(result.result).toEqual({ otherWorkflow: { child: true } });
+    expect(result.steps).toEqual({ child: { child: true }, other: { child: true } });
+    expect(Object.keys(result.stepMeta)).toEqual(['child', 'other']);
   });
 });

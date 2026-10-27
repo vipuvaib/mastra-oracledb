@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import '@/test/english-locale';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
@@ -606,7 +607,7 @@ describe('Trace Intelligence page', () => {
       );
       renderSignalsPageWithShell('billing-agent');
 
-      expect(await screen.findByText('Snapshot 1/2 · Jul 1–8, 2026 · 20 traces')).not.toBeNull();
+      expect(await screen.findByText('Snapshot 1/2 · Jul 1 – 8, 2026 · 20 traces')).not.toBeNull();
       expect(headerEntityCrumb().textContent).toContain('billing-agent');
     });
   });

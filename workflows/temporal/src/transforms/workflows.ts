@@ -108,16 +108,28 @@ function getTemporalWorkflowRuntimeOptions(program: t.Program): t.ObjectExpressi
         continue;
       }
 
-      for (const property of temporalParams.properties) {
-        if (
-          t.isObjectProperty(property) &&
-          getObjectPropertyName(property) === 'startToCloseTimeout' &&
-          t.isExpression(property.value)
-        ) {
-          return t.objectExpression([
-            t.objectProperty(t.identifier('startToCloseTimeout'), t.cloneNode(property.value, true)),
-          ]);
+      const runtimeProperties = new Map<string, t.ObjectProperty>();
+      const collectRuntimeProperties = (params: t.ObjectExpression): void => {
+        for (const property of params.properties) {
+          if (t.isSpreadElement(property)) {
+            if (!t.isObjectExpression(property.argument)) {
+              continue;
+            }
+            collectRuntimeProperties(property.argument);
+            continue;
+          }
+          if (!t.isObjectProperty(property) || !t.isExpression(property.value)) {
+            continue;
+          }
+          const name = getObjectPropertyName(property);
+          if (name === 'startToCloseTimeout' || name === 'retry') {
+            runtimeProperties.set(name, t.objectProperty(t.identifier(name), t.cloneNode(property.value, true)));
+          }
         }
+      };
+      collectRuntimeProperties(temporalParams);
+      if (runtimeProperties.size > 0) {
+        return t.objectExpression([...runtimeProperties.values()]);
       }
     }
   }
@@ -202,8 +214,11 @@ function collectStepBindings(program: t.Program): Map<string, string> {
   return stepBindings;
 }
 
-function collectWorkflowBindings(program: t.Program, filePath: string): Map<string, string> {
-  const workflowBindings = new Map<string, string>();
+// The Temporal workflow type the child runs as, and the Mastra workflow id its step records use.
+type WorkflowBinding = { workflowType: string; workflowId: string };
+
+function collectWorkflowBindings(program: t.Program, filePath: string): Map<string, WorkflowBinding> {
+  const workflowBindings = new Map<string, WorkflowBinding>();
 
   for (const statement of program.body) {
     if (
@@ -229,7 +244,7 @@ function collectWorkflowBindings(program: t.Program, filePath: string): Map<stri
       }
 
       const { workflowId } = getWorkflowIdMetadata(workflowConfig, declaration.id.name, filePath);
-      workflowBindings.set(declaration.id.name, toWorkflowType(workflowId));
+      workflowBindings.set(declaration.id.name, { workflowType: toWorkflowType(workflowId), workflowId });
     }
   }
 
@@ -273,7 +288,7 @@ function rewriteChainMethod(
   workflowId: string,
   mappingOrdinal: number,
   stepBindings: Map<string, string>,
-  workflowBindings: Map<string, string>,
+  workflowBindings: Map<string, WorkflowBinding>,
 ): { name: string; args: t.Expression[] } {
   const argNode = (index: number): t.Node | undefined => method.args[index];
   const rewritten = (args: t.Expression[], name = method.name) => ({ name, args });
@@ -284,9 +299,12 @@ function rewriteChainMethod(
     case 'then': {
       const arg = argNode(0);
       if (t.isIdentifier(arg)) {
-        const workflowType = workflowBindings.get(arg.name);
-        if (workflowType) {
-          return rewritten([t.stringLiteral(workflowType)], 'thenWorkflow');
+        const binding = workflowBindings.get(arg.name);
+        if (binding) {
+          return rewritten(
+            [t.stringLiteral(binding.workflowType), t.stringLiteral(binding.workflowId)],
+            'thenWorkflow',
+          );
         }
       }
 
@@ -335,11 +353,12 @@ function rewriteChainMethod(
       }
       const entries = arg.elements.map(element => {
         if (t.isIdentifier(element)) {
-          const workflowType = workflowBindings.get(element.name);
-          if (workflowType) {
+          const binding = workflowBindings.get(element.name);
+          if (binding) {
             return t.objectExpression([
               t.objectProperty(t.identifier('type'), t.stringLiteral('childWorkflow')),
-              t.objectProperty(t.identifier('workflowType'), t.stringLiteral(workflowType)),
+              t.objectProperty(t.identifier('workflowType'), t.stringLiteral(binding.workflowType)),
+              t.objectProperty(t.identifier('id'), t.stringLiteral(binding.workflowId)),
             ]);
           }
         }
@@ -453,7 +472,7 @@ function createTemporalWorkflowStatements(
   filePath: string,
   includeCommit: boolean,
   stepBindings: Map<string, string>,
-  workflowBindings: Map<string, string>,
+  workflowBindings: Map<string, WorkflowBinding>,
   runtimeOptions?: t.ObjectExpression,
 ): t.Statement[] {
   // Start from `createWorkflow(<static id>)` and rebuild the chain one call at a time
@@ -585,7 +604,7 @@ interface WorkflowTransformState {
   inlineExportedWorkflowNames: Set<string>;
   strippedNames: Set<string>;
   stepBindings: Map<string, string>;
-  workflowBindings: Map<string, string>;
+  workflowBindings: Map<string, WorkflowBinding>;
   workflowExports: TemporalWorkflowExport[];
   runtimeOptions?: t.ObjectExpression;
 }
@@ -689,7 +708,7 @@ function getNormalizedWorkflowBindingName(name: string, state: WorkflowTransform
     return null;
   }
 
-  return state.workflowBindings.get(name) ?? name;
+  return state.workflowBindings.get(name)?.workflowType ?? name;
 }
 
 function rewriteWorkflowNamedExport(statement: t.ExportNamedDeclaration, state: WorkflowTransformState): void {

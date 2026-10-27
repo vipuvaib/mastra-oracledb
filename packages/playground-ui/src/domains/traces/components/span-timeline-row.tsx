@@ -5,15 +5,14 @@ import type { SpanRowContext } from './span-rows';
 import { SpanTimingHoverCard } from './span-timing-hover-card';
 import { TimelineStructureSign } from './timeline-structure-sign';
 import { HoverCard, HoverCardTrigger } from '@/ds/components/HoverCard';
+import { Txt } from '@/ds/components/Txt/Txt';
+import { focusRing, focusRingInset } from '@/ds/primitives/transitions';
 import { cn } from '@/lib/utils';
+import { formatDurationPrecise } from '@/utils/duration';
 
 export type SpanTimelineRowProps = {
   ctx: SpanRowContext;
 };
-
-function formatDuration(ms: number) {
-  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
-}
 
 /**
  * One row of `TraceSpanTimeline`: compact single-line name cell plus a bar on the
@@ -24,9 +23,9 @@ export function SpanTimelineRow({ ctx }: SpanTimelineRowProps) {
   const {
     span,
     spanUI,
-    depth,
     isRootSpan,
     isLastChild,
+    guides,
     isExpanded,
     isSelected,
     isFaded,
@@ -42,8 +41,9 @@ export function SpanTimelineRow({ ctx }: SpanTimelineRowProps) {
   // Nested rows mount late, once expansion opens, so scroll on mount as well as on change.
   useEffect(() => {
     if (!shouldScrollIntoView) return;
-    rowRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-  }, [shouldScrollIntoView]);
+    // A highlighted span is centered so it never sits at the panel's edge; a clicked one only moves if hidden.
+    rowRef.current?.scrollIntoView({ block: isRevealed ? 'center' : 'nearest', behavior: 'smooth' });
+  }, [shouldScrollIntoView, isRevealed]);
 
   const { startShiftMs, leftPercent, widthPercent } = getSpanTimingLayout(span, overallLatency, overallStartTime);
   const toggleLabel = isExpanded
@@ -65,32 +65,40 @@ export function SpanTimelineRow({ ctx }: SpanTimelineRowProps) {
         },
       )}
     >
-      <div className="flex min-w-0 items-stretch" style={{ paddingLeft: `${depth}rem` }}>
-        {!isRootSpan && <TimelineStructureSign isLastChild={isLastChild} />}
+      <div className="flex min-w-0 items-stretch pl-1">
+        <TimelineStructureSign
+          guides={guides}
+          isRootSpan={isRootSpan}
+          isLastChild={isLastChild}
+          hasStem={expansion.hasChildren && isExpanded}
+          dot={
+            <span
+              aria-hidden
+              title={spanUI?.label}
+              style={{ backgroundColor: spanUI?.color }}
+              className="size-2 shrink-0 rounded-full"
+            />
+          }
+        />
 
         <button
           type="button"
           className={cn(
-            'flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded-md px-2 text-left text-caption text-foreground',
-            'focus:outline-none focus-visible:ring-1 focus-visible:ring-accent1 focus-visible:ring-inset',
+            'text-foreground',
+            'flex min-w-0 flex-1 cursor-pointer items-center rounded-md pr-2 pl-1.5 text-left',
+            focusRingInset,
           )}
         >
-          {spanUI?.color && (
-            <span
-              aria-hidden
-              title={spanUI.label}
-              className="inline-block size-2 shrink-0 rounded-full"
-              style={{ backgroundColor: spanUI.color }}
-            />
-          )}
-          <span
+          <Txt
+            as="span"
+            variant="caption"
             data-highlight={span.matchedInPayloadOnly ? undefined : ''}
             data-highlight-indirect={span.matchedInPayloadOnly ? '' : undefined}
             title={span.matchedInPayloadOnly ? 'Matches your search in this span’s details' : undefined}
             className="min-w-0 truncate"
           >
             {span.name}
-          </span>
+          </Txt>
         </button>
 
         {/* Slot is always present so names stay aligned whether or not the span has children. */}
@@ -107,7 +115,7 @@ export function SpanTimelineRow({ ctx }: SpanTimelineRowProps) {
               className={cn(
                 'flex size-5 cursor-pointer items-center justify-center rounded-md',
                 'hover:bg-fill [&:hover>svg]:opacity-100 [&>svg]:size-4 [&>svg]:opacity-50',
-                'focus:outline-none focus-visible:ring-1 focus-visible:ring-accent1',
+                focusRing,
               )}
             >
               {isExpanded ? <ChevronDownIcon /> : <ChevronRightIcon />}
@@ -132,9 +140,9 @@ export function SpanTimelineRow({ ctx }: SpanTimelineRowProps) {
               }}
             />
           </div>
-          <div className="w-12 text-right text-meta text-muted-foreground tabular-nums">
-            {formatDuration(span.latency)}
-          </div>
+          <Txt as="p" variant="meta" font="mono" tone="muted" className="w-12 text-right">
+            {formatDurationPrecise(span.latency)}
+          </Txt>
         </HoverCardTrigger>
         <SpanTimingHoverCard span={span} startShiftMs={startShiftMs} />
       </HoverCard>

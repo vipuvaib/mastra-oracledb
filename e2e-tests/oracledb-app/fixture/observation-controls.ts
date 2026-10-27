@@ -5,7 +5,7 @@ import type { Memory } from '@mastra/memory';
 export async function observationControls(memory: Memory, storage: MastraCompositeStore) {
   const store = (await storage.getStore('memory'))!;
   const engine = (await memory.omEngine)!;
-  const append = store.updateBufferedObservations.bind(store);
+  const append = store.appendBufferedObservations.bind(store);
   const swap = store.swapBufferedToActive.bind(store);
   let ackTarget: string | undefined;
   let lateTarget: { threadId: string; resourceId: string } | undefined;
@@ -24,9 +24,9 @@ export async function observationControls(memory: Memory, storage: MastraComposi
       increment: number;
     },
   };
-  store.updateBufferedObservations = async input => {
+  store.appendBufferedObservations = async input => {
     probe.appendAttempts.push({ recordId: input.id, cycleId: input.chunk.cycleId });
-    await append(input);
+    const result = await append(input);
     if (ackTarget === input.id) {
       ackTarget = undefined;
       const row = await engine.getRecord(current.threadId, current.resourceId);
@@ -34,6 +34,7 @@ export async function observationControls(memory: Memory, storage: MastraComposi
       probe.postCommitFailures++;
       throw Object.assign(new Error('test-only ECONNRESET after buffered observation commit'), { code: 'ECONNRESET' });
     }
+    return result;
   };
   let current = { threadId: '', resourceId: '' };
   store.swapBufferedToActive = async input => {

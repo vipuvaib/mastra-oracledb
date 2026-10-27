@@ -146,6 +146,43 @@ describe('transcript reducer message entries', () => {
     ]);
   });
 
+  it('restores pending tool approvals from persisted assistant metadata', () => {
+    const args = { itemId: 'item-1', to: 'review' };
+    const message = dbMessage('assistant-approval', 'assistant', [
+      {
+        type: 'tool-invocation',
+        toolInvocation: { state: 'call', toolCallId: 'approve-1', toolName: 'factory_transition_work_item', args },
+      },
+    ]);
+    message.content.metadata = {
+      pendingToolApprovals: {
+        'approve-1': { toolCallId: 'approve-1', toolName: 'factory_transition_work_item', args, type: 'approval' },
+      },
+    };
+
+    let state = createInitialTranscript({ messages: [message] });
+    state = transcriptReducer(state, {
+      type: 'event',
+      event: {
+        type: 'tool_approval_required',
+        toolCallId: 'approve-1',
+        toolName: 'factory_transition_work_item',
+        args,
+      },
+    });
+
+    expect(state.entries).toEqual([
+      expect.objectContaining({ kind: 'message', id: 'assistant-approval' }),
+      {
+        kind: 'approval',
+        id: 'approval-approve-1',
+        toolCallId: 'approve-1',
+        toolName: 'factory_transition_work_item',
+        args,
+      },
+    ]);
+  });
+
   it('projects persisted and live user signals to user messages without changing canonical content', () => {
     const persisted = signalMessage({
       id: 'user-signal-1',
@@ -849,6 +886,62 @@ describe('transcript reducer mergeWindow', () => {
     expect(ids).toEqual(['history-1', 'history-2', 'live-1']);
   });
 
+  it('clears pending when the refetched window brings in the reply the stream missed', () => {
+    const sent = transcriptReducer(initialTranscript, { type: 'localUser', id: 'user-1', text: 'question' });
+    expect(sent.pending).toBe(true);
+
+    const next = transcriptReducer(sent, {
+      type: 'mergeWindow',
+      messages: [
+        dbMessage('user-1', 'user', [{ type: 'text', text: 'question' }]),
+        dbMessage('reply-1', 'assistant', [{ type: 'text', text: 'answer' }]),
+      ],
+    });
+
+    expect(next.entries.map(e => (e.kind === 'message' ? e.id : e.kind))).toEqual(['user-1', 'reply-1']);
+    expect(next.pending).toBe(false);
+  });
+
+  it('keeps pending when the refetched window has no reply to the latest prompt yet', () => {
+    let state = createInitialTranscript({
+      messages: [
+        dbMessage('user-0', 'user', [{ type: 'text', text: 'earlier' }]),
+        dbMessage('reply-0', 'assistant', [{ type: 'text', text: 'earlier answer' }]),
+      ],
+    });
+    state = transcriptReducer(state, { type: 'localUser', id: 'user-1', text: 'question' });
+
+    const next = transcriptReducer(state, {
+      type: 'mergeWindow',
+      messages: [
+        dbMessage('user-0', 'user', [{ type: 'text', text: 'earlier' }]),
+        dbMessage('reply-0', 'assistant', [{ type: 'text', text: 'earlier answer' }]),
+        dbMessage('user-1', 'user', [{ type: 'text', text: 'question' }]),
+      ],
+    });
+
+    expect(next.pending).toBe(true);
+  });
+
+  it('keeps pending when only the live, still-empty reply follows the prompt', () => {
+    const sent = transcriptReducer(initialTranscript, { type: 'localUser', id: 'user-1', text: 'question' });
+    const started = transcriptReducer(sent, {
+      type: 'event',
+      event: {
+        type: 'message_start',
+        message: dbMessage('assistant-1', 'assistant', [{ type: 'text', text: '' }]),
+      },
+    });
+    expect(started.pending).toBe(true);
+
+    const next = transcriptReducer(started, {
+      type: 'mergeWindow',
+      messages: [dbMessage('user-1', 'user', [{ type: 'text', text: 'question' }])],
+    });
+
+    expect(next.pending).toBe(true);
+  });
+
   it('is a no-op for an empty older window', () => {
     const onScreen = createInitialTranscript({
       messages: [dbMessage('msg-1', 'user', [{ type: 'text', text: 'only' }])],
@@ -1399,6 +1492,27 @@ describe('transcript reducer error notices', () => {
     return notice.text;
   }
 
+  it('offers a provider login on a missing-credential error', () => {
+    const state = transcriptReducer(initialTranscript, {
+      type: 'event',
+      event: { type: 'error', error: { name: 'ProviderAuthRequiredError', message: 'Not logged in to Anthropic.' } },
+    });
+    expect(state.entries.at(-1)).toMatchObject({
+      kind: 'notice',
+      level: 'error',
+      text: 'Not logged in to Anthropic.',
+      action: 'provider-login',
+    });
+  });
+
+  it('offers no action on other errors', () => {
+    const state = transcriptReducer(initialTranscript, {
+      type: 'event',
+      event: { type: 'error', error: { name: 'Error', message: 'boom' } },
+    });
+    expect(state.entries.at(-1)).not.toHaveProperty('action');
+  });
+
   it('renders a string error payload verbatim', () => {
     expect(errorNoticeText({ error: 'model quota exhausted' })).toBe('model quota exhausted');
   });
@@ -1793,5 +1907,38 @@ describe('live user signals sent by someone else', () => {
     );
     expect(drawable).toHaveLength(1);
     expect(drawable[0]?.id).toMatch(/^local-/);
+  });
+
+  it("draws the viewer's own message sent from another client with no optimistic echo", () => {
+    let state = createInitialTranscript({ messages: [], threadId: 't1' });
+    const message = liveSignal('sig-3', 'hello from the TUI', { id: 'user_me', name: 'Me' });
+
+    state = transcriptReducer(state, { type: 'event', event: { type: 'message_start', message }, viewerId: 'user_me' });
+
+    const entry = state.entries.find(e => 'id' in e && e.id === 'sig-3');
+    expect(messageParts(entry)).toEqual([{ type: 'text', text: 'hello from the TUI' }]);
+  });
+
+  it('draws a same-text message from another client after the composer send was echoed', () => {
+    let state = createInitialTranscript({ messages: [], threadId: 't1' });
+    const me = { id: 'user_me', name: 'Me' };
+    state = transcriptReducer(state, { type: 'localUser', text: 'yes' });
+    state = transcriptReducer(state, {
+      type: 'event',
+      event: { type: 'message_start', message: liveSignal('sig-4', 'yes', me) },
+      viewerId: 'user_me',
+    });
+    state = transcriptReducer(state, {
+      type: 'event',
+      event: { type: 'message_start', message: liveSignal('sig-5', 'yes', me) },
+      viewerId: 'user_me',
+    });
+
+    const drawable = state.entries.filter(
+      entry => entry.kind === 'message' && messageParts(entry).some(part => (part as { text?: string }).text === 'yes'),
+    );
+    expect(drawable).toHaveLength(2);
+    expect(drawable[0]?.id).toMatch(/^local-/);
+    expect(drawable[1]?.id).toBe('sig-5');
   });
 });

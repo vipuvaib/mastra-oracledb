@@ -22,10 +22,12 @@ import { escapeUnescapedControlCharsInJsonStrings } from '../../stream/base/outp
 import { MastraAgentNetworkStream } from '../../stream/MastraAgentNetworkStream';
 import { getNeedsApprovalFn } from '../../tools/toolchecks';
 import type { IdGeneratorContext } from '../../types';
+import { safeStringify } from '../../utils/safe-stringify';
 import { createWorkflow } from '../../workflows/create';
 import type { Step, SuspendOptions } from '../../workflows/step';
 import { createStep } from '../../workflows/workflow';
 import { PRIMITIVE_TYPES } from '../types';
+import { runBeforeApprovalChecks } from '../workflows/agentic-execution/tool-approval-verdict';
 import { pruneAgentLoopSnapshot } from '../workflows/prune-snapshot';
 
 /**
@@ -407,15 +409,16 @@ export async function prepareMemoryStep({
         promises.push(
           routingAgent
             .genTitle(userMessage, requestContext, observabilityContext, titleModel, titleInstructions)
-            .then(title => {
-              if (title) {
-                return memory.createThread({
-                  threadId: thread.id,
-                  resourceId: thread.resourceId,
-                  memoryConfig,
-                  title,
-                  metadata: thread.metadata,
-                });
+            .then(async title => {
+              if (!title) return;
+              // Update-only: the thread may have been deleted while the title was generating (#25203).
+              if (!(await memory.getThreadById({ threadId: thread.id }))) return;
+              try {
+                await memory.updateThread({ id: thread.id, title, memoryConfig });
+              } catch (error) {
+                // A delete can still land between the check and the update; only swallow that case.
+                if (!(await memory.getThreadById({ threadId: thread.id }))) return;
+                throw error;
               }
             }),
         );
@@ -597,6 +600,7 @@ export async function createNetworkLoop({
           inputProcessors: [],
           logger: agent.getMastraInstance()?.getLogger() || noopLogger,
           agentName: agent.name,
+          agent,
         })
       : null;
 
@@ -1250,7 +1254,12 @@ export async function createNetworkLoop({
 
       // listen for the network-level abort signal
       const networkAbortCb = async () => {
-        await run.cancel();
+        // run.cancel() rejects when the cancel can't be published; an event listener has no caller to surface it to.
+        try {
+          await run.cancel();
+        } catch (err) {
+          mastra?.getLogger()?.error(`Failed to cancel workflow "${wf.id}" run ${runId} after network abort`, err);
+        }
         await onAbort?.({
           primitiveType: 'workflow',
           primitiveId: inputData.primitiveId,
@@ -1633,7 +1642,15 @@ export async function createNetworkLoop({
             task: inputData.task,
           });
         }
-        if (!resumeData) {
+        const rejection = resumeData
+          ? undefined
+          : await runBeforeApprovalChecks({
+              tool,
+              input: inputDataToUse,
+              context: { toolCallId, toolName: toolId, requestContext },
+              logger,
+            });
+        if (!resumeData && !rejection) {
           const requireApprovalResumeSchema = JSON.stringify(
             standardSchemaToJSONSchema(toStandardSchema(toolApprovalSchema)),
           );
@@ -1702,64 +1719,66 @@ export async function createNetworkLoop({
               toolCallId,
             },
           });
-        } else {
-          if (!resumeData.approved) {
-            const rejectionResult = resolveDeclineReason(resumeData);
-            await saveMessagesWithProcessors(
-              memory,
-              [
-                {
-                  id: generateId(),
-                  type: 'text',
-                  role: 'assistant',
-                  content: {
-                    parts: [
-                      {
-                        type: 'text',
-                        text: JSON.stringify({
-                          isNetwork: true,
-                          selectionReason: inputData.selectionReason,
-                          primitiveType: inputData.primitiveType,
-                          primitiveId: inputData.primitiveId,
-                          finalResult: { result: rejectionResult, toolCallId },
-                          input: inputDataToUse,
-                        }),
-                      },
-                    ],
-                    format: 2,
-                    metadata: {
-                      mode: 'network',
+        } else if (rejection || !resumeData?.approved) {
+          const rejectionResult = rejection
+            ? typeof rejection.output === 'string'
+              ? rejection.output
+              : safeStringify(rejection.output)
+            : resolveDeclineReason(resumeData);
+          await saveMessagesWithProcessors(
+            memory,
+            [
+              {
+                id: generateId(),
+                type: 'text',
+                role: 'assistant',
+                content: {
+                  parts: [
+                    {
+                      type: 'text',
+                      text: JSON.stringify({
+                        isNetwork: true,
+                        selectionReason: inputData.selectionReason,
+                        primitiveType: inputData.primitiveType,
+                        primitiveId: inputData.primitiveId,
+                        finalResult: { result: rejectionResult, toolCallId },
+                        input: inputDataToUse,
+                      }),
                     },
+                  ],
+                  format: 2,
+                  metadata: {
+                    mode: 'network',
                   },
-                  createdAt: new Date(),
-                  threadId: initData.threadId || runId,
-                  resourceId: initData.threadResourceId || networkName,
                 },
-              ] as MastraDBMessage[],
-              processorRunner,
-              { requestContext },
-            );
+                createdAt: new Date(),
+                threadId: initData.threadId || runId,
+                resourceId: initData.threadResourceId || networkName,
+              },
+            ] as MastraDBMessage[],
+            processorRunner,
+            { requestContext },
+          );
 
-            const endPayload = {
-              task: inputData.task,
-              primitiveId: inputData.primitiveId,
-              primitiveType: inputData.primitiveType,
-              result: rejectionResult,
-              isComplete: false,
-              iteration: inputData.iteration,
-              toolCallId,
-              toolName: toolId,
-            };
+          const endPayload = {
+            task: inputData.task,
+            primitiveId: inputData.primitiveId,
+            primitiveType: inputData.primitiveType,
+            result: rejectionResult,
+            isComplete: false,
+            iteration: inputData.iteration,
+            toolCallId,
+            toolName: toolId,
+          };
 
-            await writer?.write({
-              type: 'tool-execution-end',
-              payload: endPayload,
-              from: ChunkFrom.NETWORK,
-              runId,
-            });
+          await writer?.write({
+            type: 'tool-execution-end',
+            payload: endPayload,
+            from: ChunkFrom.NETWORK,
+            runId,
+          });
 
-            return endPayload;
-          }
+          return endPayload;
         }
       }
 

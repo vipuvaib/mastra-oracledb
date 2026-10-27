@@ -14,15 +14,17 @@
  * Because that message is a real assistant record, the failed turn forms a
  * persistable pair with its user message through the ordinary memory path.
  *
- * Only `{ name, message }` is persisted. Stack traces, causes, custom
- * enumerable fields and custom `toJSON` output stay on the runtime error
- * surfaces (stream chunk, `onError`, `result.error`); thread history has to be
- * deterministic, JSON-safe and safe to hand to clients.
+ * Only `{ name, message }` is persisted, plus `statusCode`, a bounded
+ * `responseBody` and the provider `requestId` for provider HTTP failures —
+ * without those, an `APICallError` whose message is just "Bad Request" cannot
+ * be diagnosed after the fact. Stack traces, causes, other custom fields and
+ * custom `toJSON` output stay on the runtime error surfaces (stream chunk,
+ * `onError`, `result.error`); thread history has to be deterministic and
+ * JSON-safe.
  */
 
-import { randomUUID } from 'node:crypto';
-
 import type { MastraDBMessage, MastraErrorPart, MessageList } from '../../agent/message-list';
+import { readProviderErrorDetails } from './provider-error-details';
 
 const FALLBACK_ERROR_NAME = 'Error';
 const FALLBACK_ERROR_MESSAGE = 'Unknown error';
@@ -56,6 +58,7 @@ export function toPersistedErrorIdentity(error: unknown): MastraErrorPart['error
   return {
     name: readErrorField(error, 'name') ?? FALLBACK_ERROR_NAME,
     message: readErrorField(error, 'message') ?? FALLBACK_ERROR_MESSAGE,
+    ...readProviderErrorDetails(error),
   };
 }
 
@@ -117,7 +120,7 @@ export function recordTerminalErrorMessage({
   // tracking sets, so only reuse an id that is actually free.
   const id = [activeId, attemptId].find(candidate => candidate && !messages.some(message => message.id === candidate));
   const message: MastraDBMessage = {
-    id: id ?? randomUUID(),
+    id: id ?? globalThis.crypto.randomUUID(),
     role: 'assistant',
     createdAt: new Date(),
     content: { format: 2, parts: [errorPart] },

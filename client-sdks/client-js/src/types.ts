@@ -1,4 +1,3 @@
-import type { JSONValue, ToolInvocationUIPart } from '@ai-sdk/ui-utils';
 import type {
   AgentExecutionOptions,
   MultiPrimitiveExecutionOptions,
@@ -34,7 +33,7 @@ import type {
   StorageConditionalField,
   StoredProcessorGraph,
 } from '@mastra/core/storage';
-import type { ChunkType } from '@mastra/core/stream';
+import type { ChunkType, ThreadHistoryChunk } from '@mastra/core/stream';
 import type { QueryResult } from '@mastra/core/vector';
 import type { SerializedStepFlowEntry, WorkflowResult, WorkflowRunStatus, WorkflowState } from '@mastra/core/workflows';
 import type { PublicSchema } from '@mastra/schema-compat/schema';
@@ -44,6 +43,7 @@ import type { ZodSchema as ZodSchemaV3 } from 'zod/v3';
 import type { ZodType as ZodTypeV4 } from 'zod/v4';
 
 import type { Body, PathParams, QueryParams, RouteKey, RouteResponse, Simplify } from './route-types.generated.js';
+import type { JSONValue, ToolInvocationUIPart } from './utils/ai-sdk-v4';
 
 export type ZodSchema = ZodSchemaV3 | ZodTypeV4;
 
@@ -57,7 +57,7 @@ export type PartProviderMetadata = Record<string, Record<string, JSONValue>>;
 export type MaybeProviderMetadata = { providerMetadata?: PartProviderMetadata };
 
 /**
- * `ToolInvocationUIPart` from `@ai-sdk/ui-utils` has no `providerMetadata` field, but the
+ * `ToolInvocationUIPart` from the AI SDK v4 UI types has no `providerMetadata` field, but the
  * server reads provider metadata from the part itself (not from the nested `toolInvocation`),
  * so the SDK has to be able to set it there.
  */
@@ -127,43 +127,31 @@ export interface ClientOptions {
 
 export type AgentVersionIdentifier = { versionId: string } | { status: 'draft' | 'published' };
 
-/**
- * @experimental Agent signals are experimental and may change in a future release.
- */
 export type AgentSignalActiveBehavior = 'deliver' | 'persist' | 'discard';
 
-/**
- * @experimental Agent signals are experimental and may change in a future release.
- */
 export type AgentSignalIdleBehavior = 'wake' | 'persist' | 'discard';
 
-/**
- * @experimental Agent signals are experimental and may change in a future release.
- */
 export type SendAgentSignalParams = GeneratedRequest<Body<'POST /agents/:agentId/signals'>>;
 
-/**
- * @experimental Agent message APIs are experimental and may change in a future release.
- */
 export type SendAgentMessageParams = GeneratedRequest<Body<'POST /agents/:agentId/send-message'>>;
 
-/**
- * @experimental Agent message APIs are experimental and may change in a future release.
- */
 export type QueueAgentMessageParams = GeneratedRequest<Body<'POST /agents/:agentId/queue-message'>>;
 
-/**
- * @experimental Agent signals are experimental and may change in a future release.
- */
+export type QueueAgentSignalParams = GeneratedRequest<Body<'POST /agents/:agentId/queue-signal'>>;
+
 export interface SubscribeAgentThreadParams {
   resourceId?: string;
   threadId: string;
+  /**
+   * Emit one `thread-history` chunk with the stored thread messages before any
+   * run parts; parts already covered by that history are not replayed.
+   */
+  withInitialHistory?: boolean | { perPage?: number };
 }
 
-/** @experimental Agent thread cancellation is experimental. */
 export type AbortAgentThreadParams = GeneratedRequest<Body<'POST /agents/:agentId/threads/abort'>>;
 
-/** @experimental Cancels pending signals on the server process handling the request. */
+/** Cancels pending signals on the server process handling the request. */
 export type CancelQueuedAgentMessagesParams = GeneratedRequest<Body<'POST /agents/:agentId/threads/signals/cancel'>>;
 
 export type CancelQueuedAgentMessagesResponse = GeneratedResponse<'POST /agents/:agentId/threads/signals/cancel'>;
@@ -183,11 +171,9 @@ export type AgentSuspendedRun = ListAgentSuspendedRunsResponse['runs'][number];
 
 export type AgentSuspendedRunToolCall = AgentSuspendedRun['toolCalls'][number];
 
-/**
- * @experimental Agent signals are experimental and may change in a future release.
- */
 export interface ProcessAgentThreadStreamOptions {
-  onChunk: (chunk: ChunkType) => void | Promise<void>;
+  /** Receives a `thread-history` chunk first when the subscription requested `withInitialHistory`. */
+  onChunk: (chunk: ChunkType | ThreadHistoryChunk) => void | Promise<void>;
   reconnect?:
     | boolean
     | {
@@ -353,7 +339,7 @@ export type NetworkStreamParams<OUTPUT = undefined> = {
   messages: MessageListInput;
   model?: string;
   tracingOptions?: TracingOptions;
-} & Omit<MultiPrimitiveExecutionOptions<OUTPUT>, 'model'>;
+} & Omit<MultiPrimitiveExecutionOptions<OUTPUT>, 'model' | 'scopes'>;
 
 export type GetAgentResponse = GeneratedResponse<'GET /agents/:agentId'> & {
   /** Handler-provided identifier omitted from the serialized route schema's value shape. */
@@ -436,7 +422,10 @@ export type StreamParamsBase<OUTPUT = undefined> = {
    */
   abortSignal?: AbortSignal;
 } & WithoutMethods<
-  Omit<AgentExecutionOptions<OUTPUT>, 'model' | 'requestContext' | 'clientTools' | 'options' | 'structuredOutput'>
+  Omit<
+    AgentExecutionOptions<OUTPUT>,
+    'model' | 'requestContext' | 'clientTools' | 'options' | 'structuredOutput' | 'scopes'
+  >
 >;
 export type StreamParamsBaseWithoutMessages<OUTPUT = undefined> = StreamParamsBase<OUTPUT>;
 export type StreamParams<OUTPUT = undefined> = StreamParamsBase<OUTPUT> & {
@@ -686,6 +675,21 @@ export type McpServerToolListResponse = GeneratedResponse<'GET /mcp/:serverId/to
  */
 export type McpToolExecuteResponse = RouteResponse<'POST /mcp/:serverId/tools/:toolId/execute'>;
 
+/** Event types an MCP server declares, plus whether test emit is served (experimental). */
+export type McpServerEventListResponse = GeneratedResponse<'GET /mcp/:serverId/events'>;
+
+/** One declared MCP server event type (experimental). */
+export type McpServerEventInfo = McpServerEventListResponse['events'][number];
+
+/** Result of polling an MCP server event type (experimental). */
+export type McpServerEventPollResponse = GeneratedResponse<'POST /mcp/:serverId/events/:eventName/poll'>;
+
+/** One occurrence of an MCP server event (experimental). */
+export type McpServerEventOccurrence = McpServerEventPollResponse['events'][number];
+
+/** A frame yielded by `streamMcpServerEvent` (experimental). */
+export type McpServerEventStreamFrame = GeneratedResponse<'POST /mcp/:serverId/events/:eventName/stream'>;
+
 /**
  * Client version of ScoreRowData with dates serialized as strings (from JSON)
  */
@@ -883,6 +887,16 @@ export interface SerializedMemoryConfig {
 }
 
 /**
+ * Stored-agent memory: a reference to a Memory instance registered on Mastra
+ * (by registry key, falling back to the instance id), an explicitly tagged
+ * inline config, or a legacy untagged inline config.
+ */
+export type StoredMemoryRef =
+  | { type: 'id'; memoryId: string }
+  | { type: 'inline'; config: SerializedMemoryConfig }
+  | SerializedMemoryConfig;
+
+/**
  * Default options for agent execution (serializable subset of AgentExecutionOptionsBase)
  */
 export interface DefaultOptions {
@@ -928,10 +942,11 @@ export interface StoredAgentToolConfig {
 /**
  * Per-MCP-client/integration tool configuration stored in agent snapshots.
  * Specifies which tools from an MCP client or integration provider are enabled and their overrides.
- * When `tools` is omitted, all tools from the source are included.
+ * An empty `tools` map (`{}`) includes all tools from the source.
+ * When `tools` is omitted, no tools are included.
  */
 export interface StoredMCPClientToolsConfig {
-  /** When omitted, all tools from the source are included. */
+  /** `{}` includes all tools from the source; when omitted, no tools are included. */
   tools?: Record<string, StoredAgentToolConfig>;
 }
 
@@ -1289,7 +1304,7 @@ export interface AgentVersionResponse {
   mcpClients?: ConditionalField<Record<string, StoredMCPClientToolsConfig>>;
   inputProcessors?: ConditionalField<StoredProcessorGraph>;
   outputProcessors?: ConditionalField<StoredProcessorGraph>;
-  memory?: ConditionalField<SerializedMemoryConfig>;
+  memory?: ConditionalField<StoredMemoryRef>;
   scorers?: ConditionalField<Record<string, StoredAgentScorerConfig>>;
   requestContextSchema?: Record<string, unknown>;
   changedFields?: string[];
@@ -1442,6 +1457,8 @@ export interface MastraPackage {
 
 export type GetSystemPackagesResponse = GeneratedResponse<'GET /system/packages'>;
 
+export type GetObservabilityCapabilitiesResponse = GeneratedResponse<'GET /observability/capabilities'>;
+
 // ============================================================================
 // Workspace Types
 // ============================================================================
@@ -1509,6 +1526,23 @@ export type WorkspaceFsMkdirResponse = GeneratedResponse<'POST /workspaces/:work
  * Response for getting file stats
  */
 export type WorkspaceFsStatResponse = GeneratedResponse<'GET /workspaces/:workspaceId/fs/stat'>;
+
+/**
+ * skills.sh registry operations (proxied by the workspace API)
+ */
+export type SkillsShSearchParams = QueryParams<'GET /workspaces/:workspaceId/skills-sh/search'>;
+export type SkillsShSearchResponse = GeneratedResponse<'GET /workspaces/:workspaceId/skills-sh/search'>;
+export type SkillsShPopularParams = QueryParams<'GET /workspaces/:workspaceId/skills-sh/popular'>;
+export type SkillsShPopularResponse = GeneratedResponse<'GET /workspaces/:workspaceId/skills-sh/popular'>;
+export type SkillsShSkill = SkillsShPopularResponse['skills'][number];
+export type SkillsShPreviewParams = QueryParams<'GET /workspaces/:workspaceId/skills-sh/preview'>;
+export type SkillsShPreviewResponse = GeneratedResponse<'GET /workspaces/:workspaceId/skills-sh/preview'>;
+export type SkillsShInstallParams = Body<'POST /workspaces/:workspaceId/skills-sh/install'>;
+export type SkillsShInstallResponse = GeneratedResponse<'POST /workspaces/:workspaceId/skills-sh/install'>;
+export type SkillsShRemoveParams = Body<'POST /workspaces/:workspaceId/skills-sh/remove'>;
+export type SkillsShRemoveResponse = GeneratedResponse<'POST /workspaces/:workspaceId/skills-sh/remove'>;
+export type SkillsShUpdateParams = Body<'POST /workspaces/:workspaceId/skills-sh/update'>;
+export type SkillsShUpdateResponse = GeneratedResponse<'POST /workspaces/:workspaceId/skills-sh/update'>;
 
 /**
  * Workspace search result
@@ -2103,7 +2137,11 @@ export type ListDatasetExperimentResultsResponse = Omit<
   results: DatasetExperimentResult[];
 };
 
-export type DatasetExperimentResultRow = Omit<DatasetExperimentResult, 'scores'>;
+export type DatasetExperimentResultRow = DatasetExperimentResult extends infer R
+  ? R extends unknown
+    ? Omit<R, 'scores'>
+    : never
+  : never;
 
 export type RunExperimentItemResponse =
   GeneratedResponse<'POST /datasets/:datasetId/experiments/:experimentId/items/:itemId/run'>;
@@ -2227,7 +2265,7 @@ export type ListBackgroundTasksResponse = GeneratedResponse<'GET /background-tas
 
 export type StreamBackgroundTasksParams = GeneratedRequest<QueryParams<'GET /background-tasks/stream'>>;
 
-export type ScheduleStatus = 'active' | 'paused';
+export type ScheduleStatus = 'active' | 'paused' | 'completed';
 
 export interface ScheduleRunSummary {
   status: WorkflowRunStatus;
@@ -2461,14 +2499,14 @@ export type BuilderRegistryInstallResponse = GeneratedResponse<'POST /editor/bui
 // Wire shapes derive from the published route contracts, vocabulary from core.
 // Event-stream types can't derive this way (SSE routes carry no response
 // schema) and stay hand-written in `resources/agent-controller`.
-export type { PermissionPolicy, ToolCategory } from '@mastra/core/agent-controller';
+export type { AgentControllerThinkingLevel, PermissionPolicy, ToolCategory } from '@mastra/core/agent-controller';
 export type { TaskItemSnapshot as AgentControllerTaskSnapshot } from '@mastra/core/tools';
 
 export type AgentControllerInfo = GeneratedResponse<'GET /agent-controller'>['agentControllers'][number];
 
 export type CreateAgentControllerSessionResponse = GeneratedResponse<'POST /agent-controller/:controllerId/sessions'>;
 
-export type AgentControllerSessionState = GeneratedResponse<'GET /agent-controller/:controllerId/sessions/:resourceId'>;
+export type AgentControllerSessionState = GeneratedResponse<'GET /agent-controller/:controllerId/sessions/:sessionId'>;
 
 /**
  * Agent behavior settings, mirroring the TUI's `/settings` toggles. An absent
@@ -2501,24 +2539,24 @@ export type AgentControllerActiveRun =
  * sharing the resourceId.
  */
 export type AgentControllerThreadInfo =
-  GeneratedResponse<'GET /agent-controller/:controllerId/sessions/:resourceId/threads'>['threads'][number];
+  GeneratedResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/threads'>['threads'][number];
 
 /** A thread as returned by `createThread()` and `cloneThread()`. */
 export type CreateAgentControllerThreadResponse =
-  GeneratedResponse<'POST /agent-controller/:controllerId/sessions/:resourceId/threads'>;
+  GeneratedResponse<'POST /agent-controller/:controllerId/sessions/:sessionId/threads'>;
 
 export type AgentControllerWorkspaceStatus = GeneratedResponse<'GET /agent-controller/:controllerId/workspace'>;
 
 export type AgentControllerGoalRecord = NonNullable<
-  GeneratedResponse<'GET /agent-controller/:controllerId/sessions/:resourceId/goal'>['goal']
+  GeneratedResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/goal'>['goal']
 >;
 
 /** Per-category and per-tool approval policies. */
-export type PermissionRules = GeneratedResponse<'GET /agent-controller/:controllerId/sessions/:resourceId/permissions'>;
+export type PermissionRules = GeneratedResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/permissions'>;
 
 export type SendNotificationInput = GeneratedRequest<
-  Body<'POST /agent-controller/:controllerId/sessions/:resourceId/notifications'>
+  Body<'POST /agent-controller/:controllerId/sessions/:sessionId/notifications'>
 >;
 
 export type SendNotificationResult =
-  GeneratedResponse<'POST /agent-controller/:controllerId/sessions/:resourceId/notifications'>;
+  GeneratedResponse<'POST /agent-controller/:controllerId/sessions/:sessionId/notifications'>;

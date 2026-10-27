@@ -76,6 +76,42 @@ describe('BaseResource', () => {
     });
   });
 
+  it('should NOT retry 501 Not Implemented errors', async () => {
+    await runRetryTest({
+      statusCode: 501,
+      contentType: 'application/json',
+      responseBody: { error: 'Not Implemented' },
+      expectedRequestCount: 1, // The server lacks the capability; retrying cannot succeed
+    });
+  });
+
+  it('should NOT retry trace query execution timeouts', async () => {
+    await runRetryTest({
+      statusCode: 504,
+      contentType: 'application/json',
+      responseBody: { code: 'TRACE_QUERY_EXECUTION_TIMEOUT', message: 'Trace query timed out' },
+      expectedRequestCount: 1, // The same query would hit the same timeout budget again
+    });
+  });
+
+  it('should retry plain 504 Gateway Timeout errors', async () => {
+    await runRetryTest({
+      statusCode: 504,
+      contentType: 'text/plain',
+      responseBody: 'Gateway Timeout',
+      expectedRequestCount: 3, // Initial request + 2 retries
+    });
+  });
+
+  it('should retry 504 errors with an unrelated error code', async () => {
+    await runRetryTest({
+      statusCode: 504,
+      contentType: 'application/json',
+      responseBody: { code: 'UPSTREAM_TIMEOUT' },
+      expectedRequestCount: 3, // Initial request + 2 retries
+    });
+  });
+
   it('should retry 5xx server errors and eventually reject', async () => {
     await runRetryTest({
       statusCode: 500,

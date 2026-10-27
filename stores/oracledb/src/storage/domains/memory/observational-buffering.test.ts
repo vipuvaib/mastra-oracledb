@@ -60,7 +60,9 @@ const LOCKED_ROW = {
 
 // Deliberately different from LOCKED_ROW on every field the fix should stop
 // reading, simulating a writer that changed the row between when the caller
-// read `currentRecord` and when this swap acquired its lock.
+// read `currentRecord` and when this swap acquired its lock. Its observations
+// are a prefix of the locked row's (a later activation appended `line3`):
+// a snapshot whose text was rewritten, not appended to, is rejected instead.
 const STALE_CURRENT_RECORD: ObservationalMemoryRecord = {
   id: 'om-1',
   scope: 'resource',
@@ -71,7 +73,7 @@ const STALE_CURRENT_RECORD: ObservationalMemoryRecord = {
   lastObservedAt: new Date('2025-06-01T00:00:00.000Z'),
   originType: 'initial',
   generationCount: 0,
-  activeObservations: 'stale observations',
+  activeObservations: 'line1\nline2',
   totalTokensObserved: 100,
   observationTokenCount: 10,
   pendingMessageTokens: 0,
@@ -214,7 +216,7 @@ describe('updateBufferedObservations cycle replay', () => {
     const firstPersistedChunks = getChunks();
     expect(firstPersistedChunks).toHaveLength(1);
 
-    await expect(updateBufferedObservations(ctx, input)).resolves.toBeUndefined();
+    await expect(updateBufferedObservations(ctx, input)).resolves.toEqual({ persisted: false, recordId: 'om-1' });
 
     expect(getChunks()).toHaveLength(1);
     expect(getChunks()).toEqual(firstPersistedChunks);
@@ -247,7 +249,7 @@ describe('updateBufferedObservations cycle replay', () => {
           extractionFailures: [{ slug: 'changed-extractor', error: 'changed failure' }],
         }),
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ persisted: false, recordId: 'om-1' });
 
     expect(getChunks()).toEqual(firstPersistedChunks);
   });
@@ -260,7 +262,7 @@ describe('updateBufferedObservations cycle replay', () => {
     const firstPersistedChunks = getChunks();
     expect(firstPersistedChunks).toHaveLength(1);
 
-    await expect(updateBufferedObservations(ctx, input)).resolves.toBeUndefined();
+    await expect(updateBufferedObservations(ctx, input)).resolves.toEqual({ persisted: false, recordId: 'om-1' });
 
     expect(getChunks()).toHaveLength(1);
     expect(getChunks()).toEqual(firstPersistedChunks);

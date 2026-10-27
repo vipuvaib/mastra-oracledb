@@ -1,4 +1,3 @@
-import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type * as http from 'node:http';
 import type { Agent, ToolsInput } from '@mastra/core/agent';
@@ -6,6 +5,8 @@ import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import { MCPServerBase } from '@mastra/core/mcp';
 import type {
   MCPServerConfig as CoreMCPServerConfig,
+  MCPServerEventInfo,
+  MCPServerEventsInspector,
   MCPServerFGAConfig,
   MCPToolExecutionResultV2,
   ServerDetailInfo,
@@ -56,10 +57,21 @@ import type {
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import type { StdioServerHandle } from '@modelcontextprotocol/server/stdio';
 
+import { DEFAULT_EVENTS_HEARTBEAT_INTERVAL_MS, EVENTS_EXTENSION_ID } from '../shared/events';
+import { JSON_SCHEMA_2020_12, toJsonSchema2020 } from '../shared/json-schema-dialect';
 import { withMastraToolStrictMeta } from '../shared/mastra-tool-meta';
+import { withServerTraceContext, withoutTraceContext } from '../shared/trace-context';
+import type { CallerTraceContext } from '../shared/trace-context';
 import { ServerPromptActions, ServerResourceActions, ServerToolActions } from './actions';
+import { ServerEventActions } from './events/actions';
+import { registerEventHandlers } from './events/handlers';
+import { createEventsInspector, listEventsInfo } from './events/inspector';
+import { ServerEventRegistry, toDescriptor } from './events/registry';
+import type { MCPServerEventDefinition, MCPServerEventsOptions } from './events/types';
+import { WebhookDispatcher } from './events/webhook-dispatcher';
 import {
   INPUT_KEY,
+  callerTrace,
   hashArguments,
   principalOf,
   readContinuation,
@@ -88,6 +100,29 @@ export interface MCPServerConfig extends CoreMCPServerConfig {
   cacheHints?: MCPServerCacheHints;
   /** Integrity protection for `input_required` continuation state. */
   requestState?: MCPServerRequestStateOptions;
+  /**
+   * Event types served over the MCP Events extension (`events/list`, `events/poll`,
+   * `events/stream`), keyed by event name. Declare each with `defineEvent()`.
+   *
+   * @experimental SEP-3415 is a draft; this API may change.
+   */
+  events?: Record<string, MCPServerEventDefinition>;
+  /**
+   * Server-wide settings for `events`.
+   *
+   * @experimental SEP-3415 is a draft; this API may change.
+   */
+  eventsOptions?: MCPServerEventsOptions;
+  /**
+   * How requests from 2025-era clients (those that open with `initialize`) are served
+   * over HTTP.
+   *
+   * - `'reject'` (default): they get the unsupported-protocol-version error.
+   * - `'stateless'`: each one is answered by a fresh server instance without a session.
+   *   `GET` and `DELETE` session operations get `405`. Features that need 2026-07-28
+   *   (suspend/resume, `subscriptions/listen`, events) are not available to these clients.
+   */
+  legacy?: 'reject' | 'stateless';
 }
 
 export interface MCPServerHTTPOptions {
@@ -158,6 +193,13 @@ export class MCPServer extends MCPServerBase {
   readonly resources: ServerResourceActions;
   readonly prompts: ServerPromptActions;
   readonly toolActions: ServerToolActions;
+  /**
+   * Publishes occurrences of the configured `events` to poll, push and (when
+   * `eventsOptions.webhook` is set) webhook subscribers.
+   *
+   * @experimental SEP-3415 is a draft; this API may change.
+   */
+  readonly events: ServerEventActions;
 
   private readonly resourceOptions?: MCPServerResources;
   private readonly promptOptions?: MCPServerPrompts;
@@ -168,6 +210,11 @@ export class MCPServer extends MCPServerBase {
   private readonly mapAuthInfoToUser?: MCPAuthInfoToUserMapper;
   private readonly fga?: MCPServerFGAConfig;
   private readonly requestStateCodec: RequestStateCodec<ContinuationEnvelope>;
+  private readonly eventRegistry: ServerEventRegistry;
+  private readonly eventsOptions: MCPServerEventsOptions;
+  private eventsInspector: MCPServerEventsInspector | undefined;
+  private readonly webhooks?: WebhookDispatcher;
+  private readonly legacy: 'reject' | 'stateless';
 
   private httpHandler?: McpHttpHandler;
   private nodeHandler?: NodeMcpRequestHandler;
@@ -184,6 +231,17 @@ export class MCPServer extends MCPServerBase {
     this.resourceOptions = config.resources;
     this.loadAppResources(config.appResources);
     this.requestStateCodec = this.createRequestStateCodec(config.requestState);
+    this.eventsOptions = config.eventsOptions ?? {};
+    this.legacy = config.legacy ?? 'reject';
+    const webhook = this.eventsOptions.webhook;
+    this.eventRegistry = new ServerEventRegistry(config.events, { webhook: webhook !== undefined });
+    if (webhook && this.eventRegistry.size > 0) {
+      this.webhooks = new WebhookDispatcher({
+        registry: this.eventRegistry,
+        options: webhook,
+        getLogger: () => this.logger,
+      });
+    }
     if (config.resources?.resumeSchema) this.assertFormRepresentable('resources', config.resources.resumeSchema);
     if (config.prompts?.resumeSchema) this.assertFormRepresentable('prompts', config.prompts.resumeSchema);
 
@@ -195,12 +253,17 @@ export class MCPServer extends MCPServerBase {
     });
     this.resources = new ServerResourceActions(deps);
     this.prompts = new ServerPromptActions(deps);
+    this.events = new ServerEventActions(this.eventRegistry, () =>
+      this.eventRegistry
+        .list()
+        .map(event => toDescriptor(event, (schema, options) => this.jsonSchema(schema, options))),
+    );
   }
 
   private createRequestStateCodec(options: MCPServerRequestStateOptions | undefined) {
     let key = options?.key;
     if (key === undefined) {
-      key = randomBytes(32);
+      key = globalThis.crypto.getRandomValues(new Uint8Array(32));
       this.logger.warn(
         'No requestState.key configured: continuation state is signed with a per-process key, so a suspended request can only be resumed on this process. Set requestState.key in multi-instance and serverless deployments.',
       );
@@ -352,13 +415,20 @@ export class MCPServer extends MCPServerBase {
   /**
    * Converts a tool schema to JSON Schema 2020-12, the dialect MCP 2026-07-28
    * assumes when none is declared. The dialect declaration is kept so validators
-   * that dispatch on `$schema` pick the same draft on both sides.
+   * that dispatch on `$schema` pick the same draft on both sides. Some vendors
+   * (e.g. zod v3) emit 2019-09 for this target, so it is rewritten to 2020-12.
    */
   private jsonSchema(schema: unknown, options?: { io: 'input' | 'output' }): Record<string, unknown> | undefined {
     if (!schema) return undefined;
-    return isStandardSchemaWithJSON(schema)
-      ? (standardSchemaToJSONSchema(schema, { ...options, target: 'draft-2020-12' }) as Record<string, unknown>)
-      : ((schema as { jsonSchema?: Record<string, unknown> }).jsonSchema ?? (schema as Record<string, unknown>));
+    if (!isStandardSchemaWithJSON(schema)) {
+      return (schema as { jsonSchema?: Record<string, unknown> }).jsonSchema ?? (schema as Record<string, unknown>);
+    }
+    const converted = standardSchemaToJSONSchema(schema, { ...options, target: 'draft-2020-12' }) as Record<
+      string,
+      unknown
+    >;
+    if (!converted.$schema || converted.$schema === JSON_SCHEMA_2020_12) return converted;
+    return toJsonSchema2020(converted) ?? converted;
   }
 
   private addTools(tools: ToolsInput): void {
@@ -459,10 +529,7 @@ export class MCPServer extends MCPServerBase {
   }
 
   private hasUiMetadata(): boolean {
-    return Object.values(this.convertedTools).some(tool => {
-      const meta = tool.mcp?._meta as { ui?: { resourceUri?: string } } | undefined;
-      return Boolean(meta?.ui?.resourceUri);
-    });
+    return Object.values(this.convertedTools).some(tool => Boolean(uiResourceUri(tool.mcp?._meta)));
   }
 
   // ---------------------------------------------------------------------------
@@ -482,12 +549,31 @@ export class MCPServer extends MCPServerBase {
     if (this.appResourceList.length > 0 || this.hasUiMetadata()) {
       capabilities.extensions = { 'io.modelcontextprotocol/ui': {} };
     }
+    if (this.eventRegistry.size > 0) {
+      capabilities.extensions = { ...capabilities.extensions, [EVENTS_EXTENSION_ID]: this.eventsCapability() };
+    }
     return capabilities;
+  }
+
+  /**
+   * Settings advertised under `extensions["io.modelcontextprotocol/events"]`. `listChanged` is not
+   * advertised: the SDK's `subscriptions/listen` drops the `eventsListChanged` filter, so
+   * `notifications/events/list_changed` cannot be delivered.
+   */
+  private eventsCapability(): Record<string, never> {
+    return {};
   }
 
   private createServerInstance(): Server {
     const server = new Server(
-      { name: this.name, version: this.version },
+      {
+        name: this.name,
+        version: this.version,
+        title: this.title,
+        description: this.description,
+        websiteUrl: this.websiteUrl,
+        icons: this.icons,
+      },
       {
         capabilities: this.capabilities(),
         instructions: this.instructions,
@@ -503,7 +589,43 @@ export class MCPServer extends MCPServerBase {
     this.registerToolHandlers(server);
     this.registerResourceHandlers(server);
     this.registerPromptHandlers(server);
+    if (this.eventRegistry.size > 0) {
+      registerEventHandlers(server, {
+        registry: this.eventRegistry,
+        heartbeatIntervalMs: this.eventsOptions.heartbeatIntervalMs ?? DEFAULT_EVENTS_HEARTBEAT_INTERVAL_MS,
+        listPageSize: this.eventsOptions.listPageSize,
+        maxStreams: this.eventsOptions.maxStreams,
+        webhooks: this.webhooks,
+        getLogger: () => this.logger,
+        jsonSchema: (schema, options) => this.jsonSchema(schema, options),
+        trace: (instance, method, params, ctx, fn) => this.traceCustomRequest(instance, method, params, ctx, fn),
+      });
+    }
     return server;
+  }
+
+  /**
+   * {@link setTracedHandler} for methods outside the spec's request map (the events
+   * extension): the request runs under an `MCP_SERVER_REQUEST` span with its resolved
+   * request context. A push stream's span lasts as long as the stream.
+   */
+  private async traceCustomRequest<T>(
+    server: Server,
+    method: string,
+    params: Record<string, unknown>,
+    ctx: ServerContext,
+    fn: (requestContext: RequestContext) => Promise<T>,
+  ): Promise<T> {
+    const caller = callerTrace(ctx);
+    let requestContext: RequestContext;
+    try {
+      requestContext = await toRequestContext(ctx, this.mapAuthInfoToUser);
+    } catch (error) {
+      this.startRequestSpan(method, params, { server, ctx, caller })?.error({ error: error as Error });
+      throw error;
+    }
+    const requestSpan = this.startRequestSpan(method, params, { server, ctx, caller, requestContext });
+    return this.traceRequest(requestSpan, () => fn(requestContext));
   }
 
   /**
@@ -532,18 +654,19 @@ export class MCPServer extends MCPServerBase {
   ): void {
     server.setRequestHandler(method, async (request, ctx) => {
       const params = request.params as Record<string, unknown> | undefined;
+      const caller = callerTrace(ctx);
       // A span can only be given its request context when it is created, so auth is
       // resolved first. A mapper that throws still leaves a failed span behind.
       let requestContext: RequestContext;
       try {
         requestContext = await toRequestContext(ctx, this.mapAuthInfoToUser);
       } catch (error) {
-        this.startRequestSpan(method, params, { server, ctx })?.error({ error: error as Error });
+        this.startRequestSpan(method, params, { server, ctx, caller })?.error({ error: error as Error });
         throw error;
       }
-      const requestSpan = this.startRequestSpan(method, params, { server, ctx, requestContext });
+      const requestSpan = this.startRequestSpan(method, params, { server, ctx, caller, requestContext });
       let reportedError: Error | undefined;
-      return this.traceRequest(
+      const result = await this.traceRequest(
         requestSpan,
         () =>
           handler(request, ctx, {
@@ -555,6 +678,10 @@ export class MCPServer extends MCPServerBase {
           }),
         () => reportedError,
       );
+      // Only `tools/call` replies name the serving span: the client reads and removes
+      // the key on that path. Added after the span recorded the result, so the span
+      // output stays the handler's own.
+      return method === 'tools/call' ? withServerTraceContext(result, requestSpan, caller !== undefined) : result;
     });
   }
 
@@ -565,7 +692,7 @@ export class MCPServer extends MCPServerBase {
   private startRequestSpan(
     method: string,
     params: Record<string, unknown> | undefined,
-    connection?: { server?: Server; ctx?: ServerContext; requestContext?: RequestContext },
+    connection?: { server?: Server; ctx?: ServerContext; caller?: CallerTraceContext; requestContext?: RequestContext },
   ): Span<SpanType.MCP_SERVER_REQUEST> | undefined {
     // A stateless HTTP request carries its own envelope; a stdio connection
     // negotiates once and the instance holds what it agreed to.
@@ -576,6 +703,7 @@ export class MCPServer extends MCPServerBase {
       | undefined;
     const target = params?.name ?? params?.uri;
     const targetName = typeof target === 'string' ? target : undefined;
+    const caller = connection?.caller;
 
     return getOrCreateSpan({
       type: SpanType.MCP_SERVER_REQUEST,
@@ -583,7 +711,7 @@ export class MCPServer extends MCPServerBase {
       entityType: EntityType.MCP_SERVER,
       entityId: this.id,
       entityName: this.name,
-      input: params,
+      input: withoutTraceContext(params),
       attributes: {
         mcpMethod: method,
         targetName,
@@ -592,8 +720,13 @@ export class MCPServer extends MCPServerBase {
         mcpProtocolVersion: typeof protocolVersion === 'string' ? protocolVersion : undefined,
         clientName: client?.name,
         clientVersion: client?.version,
+        callerTraceparent: caller?.traceparent,
+        callerTracestate: caller?.tracestate,
       },
       tracingContext: {},
+      // The request keeps its own trace and links to the caller's span, so each
+      // side keeps its own root and trace summary in every exporter.
+      links: caller && [caller.link],
       requestContext: connection?.requestContext,
       mastra: this.mastra,
     });
@@ -748,7 +881,11 @@ export class MCPServer extends MCPServerBase {
             resumeSchema: execution.resumeSchema,
           });
         }
-        const result = this.toCallToolResult(name, tool, execution.output);
+        // 2025-era clients need non-object structured results wrapped as `{ result }`; the codec decides per era.
+        const result = server.projectCallToolResult(
+          this.toCallToolResult(name, tool, execution.output),
+          this.toolInfo(name, tool).outputSchema,
+        );
         this.logger.info(`Tool '${name}' finished in ${Date.now() - startedAt}ms.`);
         return result;
       } catch (error) {
@@ -827,15 +964,28 @@ export class MCPServer extends MCPServerBase {
       this.logger.warn(`Tool '${name}' rejected its input.`, { error: value.message });
       return errorResult(value.message);
     }
+    // Hosts may detect an MCP App from the call result, so mirror the tool's declared app link onto it.
+    const resourceUri = uiResourceUri(tool.mcp?._meta);
+    const meta = resourceUri ? { _meta: { ui: { resourceUri }, [RESOURCE_URI_META_KEY]: resourceUri } } : {};
+    // `JSON.stringify` yields `undefined` for a void return (and for functions or symbols). That has
+    // no text form, so the call succeeded with no content rather than with a text block missing `text`.
     if (!tool.outputSchema) {
-      return {
-        isError: false,
-        content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
-      };
+      const text = typeof value === 'string' ? value : JSON.stringify(value);
+      return { isError: false, content: text === undefined ? [] : [{ type: 'text', text }], ...meta };
     }
-    // Tools with an output schema already validated `value` against it.
-    const structuredContent = value as Record<string, unknown>;
-    return { isError: false, structuredContent, content: [{ type: 'text', text: JSON.stringify(structuredContent) }] };
+    // Tools with an output schema already validated `value` against it; an optional schema can let `undefined` through.
+    // A success result must then carry `structuredContent`, so report the missing output in-band instead.
+    const text = JSON.stringify(value);
+    if (text === undefined) {
+      this.logger.warn(`Tool '${name}' declares an outputSchema but returned no structured output.`);
+      return { ...errorResult(`Tool '${name}' declares an outputSchema but returned no output.`), ...meta };
+    }
+    return {
+      isError: false,
+      structuredContent: value as Record<string, unknown>,
+      content: [{ type: 'text', text }],
+      ...meta,
+    };
   }
 
   private registerResourceHandlers(server: Server): void {
@@ -1062,7 +1212,7 @@ export class MCPServer extends MCPServerBase {
   private getNodeHandler(): NodeMcpRequestHandler {
     if (!this.nodeHandler) {
       this.httpHandler = createMcpHandler(() => this.createServerInstance(), {
-        legacy: 'reject',
+        legacy: this.legacy,
         onerror: error => this.logger.error('MCP handler error', { error: error.toString() }),
       });
       this.nodeHandler = toNodeHandler(this.httpHandler, {
@@ -1089,7 +1239,8 @@ export class MCPServer extends MCPServerBase {
 
   /**
    * Handles one Streamable HTTP request at `httpPath`. Every request is
-   * self-contained; requests without a 2026-07-28 envelope are rejected.
+   * self-contained; requests without a 2026-07-28 envelope are rejected unless
+   * `legacy: 'stateless'` is configured.
    */
   async startHTTP({ url, httpPath, req, res, options }: MCPServerHTTPOptions): Promise<void> {
     if (url.pathname !== httpPath) {
@@ -1132,6 +1283,13 @@ export class MCPServer extends MCPServerBase {
   }
 
   async close(): Promise<void> {
+    this.webhooks?.close();
+    // Ends open event streams first, then yields a macrotask so the protocol writes their final
+    // results before the transports are torn down.
+    if (this.eventRegistry.openStreams.size > 0) {
+      this.eventRegistry.closeStreams();
+      await new Promise(resolve => setImmediate(resolve));
+    }
     if (this.stdioHandle) {
       await this.stdioHandle.close();
       this.stdioHandle = undefined;
@@ -1247,9 +1405,12 @@ export class MCPServer extends MCPServerBase {
   }
 
   /** Reads an `ui://` app resource; application resources require a protocol request. */
-  async readResource(uri: string): Promise<{ contents: Array<{ uri: string; text?: string; blob?: string }> }> {
+  async readResource(uri: string): Promise<{
+    contents: Array<{ uri: string; text?: string; blob?: string; mimeType?: string; _meta?: Record<string, unknown> }>;
+  }> {
     const html = this.appResourceHtml.get(uri);
-    if (html === undefined) {
+    const resource = this.appResourceList.find(r => r.uri === uri);
+    if (html === undefined || !resource) {
       throw new MastraError({
         id: 'MCP_SERVER_RESOURCE_NOT_FOUND',
         domain: ErrorDomain.MCP,
@@ -1258,12 +1419,42 @@ export class MCPServer extends MCPServerBase {
         details: { uri },
       });
     }
-    return { contents: [{ uri, text: html }] };
+    return { contents: [this.resourceContents(resource, { text: html })] };
   }
 
   /** Lists `ui://` app resources; application resources require a protocol request. */
   async listResources(): Promise<{ resources: Resource[] }> {
     return { resources: [...this.appResourceList] };
+  }
+
+  /**
+   * The declared event types as Studio shows them, or `undefined` when the server has none.
+   * @experimental
+   */
+  getEventsInfo(): { events: MCPServerEventInfo[] } | undefined {
+    if (this.eventRegistry.size === 0) return undefined;
+    return { events: listEventsInfo(this.eventsDeps()) };
+  }
+
+  /**
+   * Polls, streams and test-emits events in-process through the `events/poll` and
+   * `events/stream` code paths, or `undefined` when the server has none. Used by Studio.
+   * @experimental
+   */
+  getEventsInspector(): MCPServerEventsInspector | undefined {
+    if (this.eventRegistry.size === 0) return undefined;
+    this.eventsInspector ??= createEventsInspector(this.eventsDeps());
+    return this.eventsInspector;
+  }
+
+  private eventsDeps() {
+    return {
+      registry: this.eventRegistry,
+      heartbeatIntervalMs: this.eventsOptions.heartbeatIntervalMs ?? DEFAULT_EVENTS_HEARTBEAT_INTERVAL_MS,
+      maxStreams: this.eventsOptions.maxStreams,
+      getLogger: () => this.logger,
+      jsonSchema: (schema: unknown, options: { io: 'input' | 'output' }) => this.jsonSchema(schema, options),
+    };
   }
 }
 
@@ -1276,14 +1467,18 @@ function errorResult(text: string): CallToolResult {
   return { content: [{ type: 'text', text }], isError: true };
 }
 
-/** Keeps `_meta.ui.resourceUri` and the flat MCP Apps key in sync for older hosts. */
+/** The tool's MCP App URI; the nested key wins over the flat one, as in ext-apps' `getToolUiResourceUri`. */
+function uiResourceUri(meta: Record<string, unknown> | undefined): string | undefined {
+  const ui = meta?.ui as { resourceUri?: string } | undefined;
+  return ui?.resourceUri || (meta?.[RESOURCE_URI_META_KEY] as string | undefined) || undefined;
+}
+
+/** Writes the tool's MCP App URI to both the nested and the flat key, so every host opens the same app. */
 function normalizeUiMeta(meta: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
-  if (!meta) return undefined;
-  const ui = meta.ui as { resourceUri?: string } | undefined;
-  const flat = meta[RESOURCE_URI_META_KEY] as string | undefined;
-  if (ui?.resourceUri && !flat) return { ...meta, [RESOURCE_URI_META_KEY]: ui.resourceUri };
-  if (flat && !ui?.resourceUri) return { ...meta, ui: { ...(ui ?? {}), resourceUri: flat } };
-  return meta;
+  const resourceUri = uiResourceUri(meta);
+  if (!meta || !resourceUri) return meta;
+  const ui = meta.ui as Record<string, unknown> | undefined;
+  return { ...meta, ui: { ...ui, resourceUri }, [RESOURCE_URI_META_KEY]: resourceUri };
 }
 
 export { ServerPromptActions, ServerResourceActions, ServerToolActions };
