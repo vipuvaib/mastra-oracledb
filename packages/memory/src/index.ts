@@ -678,6 +678,7 @@ export class Memory extends MastraMemory {
       hideSignals,
       filter,
       includeTotal,
+      include: explicitInclude = [],
     } = args;
     const config = this.getMergedThreadConfig(threadConfig || {});
     const semanticRecallEnabled = Boolean(config.semanticRecall);
@@ -696,8 +697,12 @@ export class Memory extends MastraMemory {
     );
 
     try {
-      // A disabled history configuration must not touch storage or validate thread ownership.
-      if (historyDisabledByConfig && (!config.semanticRecall || !vectorSearchString || !this.vector)) {
+      // Disabled history without explicit or semantic includes must not touch storage or validate ownership.
+      if (
+        historyDisabledByConfig &&
+        !explicitInclude.length &&
+        (!config.semanticRecall || !vectorSearchString || !this.vector)
+      ) {
         const result = {
           messages: [],
           usage: undefined,
@@ -811,14 +816,19 @@ export class Memory extends MastraMemory {
 
       // Get raw messages from storage
       const memoryStore = await this.getMemoryStore();
-      const include = filteredVectorResults.map(r => ({
-        id: r.metadata?.message_id,
-        threadId: r.metadata?.thread_id,
-        withNextMessages:
-          typeof vectorConfig.messageRange === 'number' ? vectorConfig.messageRange : vectorConfig.messageRange.after,
-        withPreviousMessages:
-          typeof vectorConfig.messageRange === 'number' ? vectorConfig.messageRange : vectorConfig.messageRange.before,
-      }));
+      const include = [
+        ...explicitInclude,
+        ...filteredVectorResults.map(r => ({
+          id: r.metadata?.message_id,
+          threadId: r.metadata?.thread_id,
+          withNextMessages:
+            typeof vectorConfig.messageRange === 'number' ? vectorConfig.messageRange : vectorConfig.messageRange.after,
+          withPreviousMessages:
+            typeof vectorConfig.messageRange === 'number'
+              ? vectorConfig.messageRange
+              : vectorConfig.messageRange.before,
+        })),
+      ];
 
       let rawMessages: MastraDBMessage[];
       let resultPage: number;
@@ -850,7 +860,7 @@ export class Memory extends MastraMemory {
         rawMessages = loaded.messages;
 
         if (include.length) {
-          const semanticMessages = await memoryStore.listMessages({
+          const includedMessages = await memoryStore.listMessages({
             threadId,
             resourceId,
             perPage: 0,
@@ -860,7 +870,7 @@ export class Memory extends MastraMemory {
           rawMessages = new MessageList({ threadId, resourceId })
             .add(rawMessages, 'memory')
             .add(
-              semanticMessages.messages.filter(message => !boundary || isAfterMemoryTokenBoundary(message, boundary)),
+              includedMessages.messages.filter(message => !boundary || isAfterMemoryTokenBoundary(message, boundary)),
               'memory',
             )
             .get.all.db();
@@ -871,8 +881,8 @@ export class Memory extends MastraMemory {
         total = rawMessages.length;
         hasMore = false;
       } else {
-        // When history is disabled by config, use perPage: 0 so only semantic recall
-        // include results are returned (not the full message history)
+        // When history is disabled by config, only explicit and semantic include
+        // results are returned (not the full message history).
         const effectivePerPage = historyDisabledByConfig ? 0 : perPage;
         const paginatedResult = await memoryStore.listMessages({
           threadId,
