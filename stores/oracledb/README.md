@@ -82,11 +82,12 @@ Direct storage callers must manage any required vector migration.
 Use `Memory.updateThreadResourceId()` to coordinate storage transfer with semantic-recall message
 vector migration. When a vector store, embedder, and semantic recall are configured, this method
 deletes the thread's existing message vectors and re-embeds its messages under the new resource.
-This doesn't migrate all derived memory, such as observational-memory records or observation vectors.
+With a vector store configured, it also moves the thread's observation-vector metadata to the new
+resource. This doesn't transfer observational-memory records.
 
 Storage transfer commits before vector migration. If migration fails, the higher-level method
 throws, but the storage transfer remains committed. Retrying the higher-level method with the
-same target resource retries the migration when the required vector configuration is present.
+same target resource retries the configured vector migration when its required configuration is present.
 Storage and vector migration aren't one atomic transaction.
 
 #### Thread deletion

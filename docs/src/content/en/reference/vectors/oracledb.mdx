@@ -278,6 +278,13 @@ The default is `indexConfig: { type: 'none' }`, which uses exact search and requ
     isOptional: true,
     description: 'Optional vector IDs. IDs are generated when omitted.',
   },
+  {
+    name: 'deleteFilter',
+    type: 'Record<string, any>',
+    isOptional: true,
+    description:
+      'Delete matching vectors before inserting the new vectors in the same transaction. Filters that match every row unconditionally are rejected. An empty object performs no deletion.',
+  },
 ]}
 />
 
@@ -332,10 +339,32 @@ The default is `indexConfig: { type: 'none' }`, which uses exact search and requ
     name: 'targetAccuracy',
     type: 'number',
     isOptional: true,
-    description: 'Target accuracy for approximate Oracle vector queries.',
+    description:
+      'Percentage accuracy target for approximate Oracle vector queries. Cannot be combined with neighborPartitionProbes.',
+  },
+  {
+    name: 'neighborPartitionProbes',
+    type: 'number',
+    isOptional: true,
+    description:
+      'Maximum number of IVF centroid partitions to search. Must be a positive safe integer. Requires an approximate query with queryVector and an IVF index. Cannot be combined with targetAccuracy.',
   },
 ]}
 />
+
+For an IVF index, set `neighborPartitionProbes` to control search breadth instead of a percentage accuracy target:
+
+```ts
+const results = await vector.query({
+  indexName: 'support_articles',
+  queryVector,
+  topK: 10,
+  queryMode: 'approx',
+  neighborPartitionProbes: 6,
+})
+```
+
+More probes can increase recall at the cost of additional query work. Compare results with exact search to choose a budget for your workload. Exact, HNSW, no-index, and metadata-only queries reject this option. Omitting it preserves the existing accuracy behavior.
 
 ### `listIndexes()`
 
@@ -347,7 +376,11 @@ Returns Oracle index metadata, including the physical table name, dimension, vec
 
 ### `deleteIndex()`
 
-Deletes the Oracle vector table and removes the registry entry for the logical index.
+Deletes the physical table and registry row selected by the logical index lookup. Use the names returned by `listIndexes()`. An exact registry key takes precedence over the legacy uppercase fallback.
+
+If no registry entry matches, deletion is a no-op. It doesn't derive a table name or delete an unregistered table. If the registered table is already missing, the method still removes the stale registry row.
+
+When separate exact and uppercase entries exist, a call deletes only the resolved entry. A repeated request after the exact entry is removed can resolve to the remaining uppercase entry.
 
 ### `updateVector()`
 
@@ -369,6 +402,14 @@ Deletes a single vector by ID.
 
 Deletes multiple vectors by IDs or by metadata filter. Either `ids` or `filter` must be provided, but not both.
 
+### Mutation filter safeguards
+
+`updateVector()`, `deleteVectors()`, and the `deleteFilter` phase of `upsert()` reject filters that compile to an unconditional match-all condition. A nonempty filter object can still be unconditional, for example `{ tags: { $contains: [] } }` or `{ $not: { tags: { $all: [] } } }`.
+
+A match-none filter, such as `{ tags: { $all: [] } }`, updates or deletes no rows. In `upsert()`, this skips deletion but still inserts or updates the supplied vectors. Query filters can match every row. The safeguard applies to destructive operations.
+
+These checks detect unconditional filter expressions, not how many rows a restrictive filter happens to match. See [Oracle metadata filter semantics](/reference/rag/metadata-filters#oracledb) when constructing filters dynamically.
+
 ### `buildIndex()`
 
 Builds an Oracle vector index for an existing logical index. If the resolved index type is `none`, this method is a no-op.
@@ -376,6 +417,10 @@ Builds an Oracle vector index for an existing logical index. If the resolved ind
 ### `rebuildIndex()`
 
 Drops and recreates the Oracle vector index for an existing logical index, typically after changing approximate-index tuning.
+
+Build, rebuild, and `createIndex()` calls against an existing table retain the logical registry key selected by lookup, including the legacy uppercase fallback.
+
+Oracle index DDL and registry updates aren't atomic. If a registry update fails after DDL succeeds, the method reports an error but the physical index change remains. Inspect the physical index and registry before retrying.
 
 ### Index diagnostics
 
@@ -408,12 +453,7 @@ Closes the Oracle pool when `OracleVector` created the pool manager. If you prov
 
 ## Metadata filters
 
-`OracleVector` accepts Mastra's standard metadata filter syntax. Filters are translated into Oracle JSON predicates with bound values:
-
-- scalar comparisons use `JSON_VALUE`
-- array, existence, and element-match checks use `JSON_EXISTS`
-- regex filters use `REGEXP_LIKE`
-- string contains filters use case-insensitive `LIKE`
+`OracleVector` accepts Mastra's standard metadata filter syntax and translates filters into Oracle JSON predicates with bound values. See [Oracle-specific metadata filter behavior](/reference/rag/metadata-filters#oracledb) for numeric comparisons, array membership, null values, and regex options.
 
 ```ts
 const results = await vector.query({

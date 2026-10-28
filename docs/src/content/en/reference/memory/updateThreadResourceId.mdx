@@ -51,8 +51,7 @@ const thread = await memory.updateThreadResourceId({
   {
     name: 'thread',
     type: 'StorageThreadType',
-    description:
-      'The updated thread with the new resourceId. If the thread already belongs to the target resource, it is returned unchanged.',
+    description: 'The thread with the target resourceId. A same-resource call can still perform vector migration.',
   },
 ]}
 />
@@ -60,9 +59,19 @@ const thread = await memory.updateThreadResourceId({
 ## Behavior
 
 - The thread's `resourceId` is reassigned to the new resource, and all of its messages are updated to reference the new resource.
-- The thread's original `createdAt` timestamp is preserved. The `updatedAt` timestamp is refreshed.
-- If the thread already belongs to the target resource, the method is a no-op and returns the existing thread.
+- When ownership changes, the thread's original `createdAt` timestamp is preserved and `updatedAt` is refreshed.
+- With a vector store, an embedder or self-embedding store, and semantic recall enabled, message vectors are deleted and re-indexed under the new resource.
+- With a vector store configured, the thread's observation-vector metadata is also moved to the new resource. This doesn't transfer observational-memory records.
+- A same-resource call can still perform vector migration, so it isn't always a no-op.
 - If the thread doesn't exist, the method throws an error.
+
+### Partial failure and retry
+
+The storage transfer commits before vector migration. If vector migration fails, the method throws, but the thread and its messages can already belong to the new resource. Storage and vector migration aren't one atomic transaction.
+
+Retry with the same `threadId` and target `resourceId` to repair the configured vector migration. A same-resource retry can re-index message vectors and move remaining observation vectors. Keep the required vector and embedding configuration available for the retry.
+
+Calling the low-level storage domain's `updateThreadResourceId()` directly doesn't perform this vector coordination.
 
 ## Security
 

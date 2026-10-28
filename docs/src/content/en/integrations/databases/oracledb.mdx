@@ -195,7 +195,7 @@ const storage = new OracleStore({
 })
 ```
 
-For external authentication, set `externalAuth: true` and omit `password`. To reuse an existing `oracledb.Pool`, pass it as `pool`. Mastra uses it but doesn't close it.
+For external authentication, set `externalAuth: true` and omit `password`. To reuse an existing `oracledb.Pool`, pass it as `pool` and close it yourself when it's no longer needed.
 
 `OracleStore` backs memory, workflow snapshots, observability, scores, scorer definitions, MCP client metadata, and agent registry data. When using the store outside a `Mastra` instance, call `await storage.init()` and access a domain with `await storage.getStore('memory')`.
 
@@ -249,6 +249,8 @@ Use `invisible` for staged rollout, then remove it after validating query plans.
 
 Use `disableInit: true` when schema changes are applied by a separate deployment step or by a database administrator.
 
+Index-creation errors fail initialization instead of being logged and ignored. If a default or custom index can't be created, correct the definition, schema state, or database privileges before retrying. `skipDefaultIndexes` skips only default index creation. Custom indexes are still applied.
+
 ## Schema export
 
 Use `exportSchemas()` to generate Oracle DDL without connecting to a database. This is useful when schema changes are reviewed or applied outside application startup.
@@ -291,6 +293,16 @@ const vector = new OracleVector({
 `OracleStore` exposes `storage.db` and `await storage.getPool()` for advanced use cases. When using these APIs directly, you're responsible for transaction boundaries and connection lifecycle.
 
 JSON metadata, payloads, and snapshots are stored in native Oracle JSON columns and encoded server-side, so the rows are readable directly with standard Oracle JDBC tools such as DBeaver and SQL Developer.
+
+### Message windows
+
+[Explicit message include windows](/reference/memory/recall#explicit-message-windows) use chronological `(createdAt, id)` order. When timestamps match, message IDs determine which messages precede or follow the anchor. Windows stay within the anchor's thread and honor a supplied resource filter.
+
+### Memory lifecycle
+
+The object returned by `storage.getStore('memory')` is the low-level storage adapter. Its `updateThreadResourceId()` updates the thread and its messages in one Oracle transaction, but doesn't migrate vector metadata. Use [Memory.updateThreadResourceId()](/reference/memory/updateThreadResourceId) to coordinate the higher-level transfer.
+
+Direct storage `deleteThread()` calls delete the thread, messages, and matching vectors from discoverable Oracle semantic-recall tables. They don't clear thread-scoped observational-memory records or coordinate a separately configured vector store. Prefer `Memory.deleteThread()` for that lifecycle, then call [memory.settled()](/reference/memory/settled) before closing connections to wait for background vector cleanup attempts. Direct storage callers must coordinate those additional cleanup steps themselves.
 
 ## Usage example
 

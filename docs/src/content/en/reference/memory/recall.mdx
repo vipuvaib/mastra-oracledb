@@ -138,6 +138,31 @@ const { messages } = await memory.recall({
 ]}
 />
 
+## Explicit message windows
+
+Use `include` to retrieve known message IDs and their context without semantic search or an embedder. Set `perPage: 0` to request only the included windows:
+
+```typescript
+const { messages } = await memory.recall({
+  threadId: 'thread-123',
+  resourceId: 'user-123',
+  perPage: 0,
+  include: [
+    {
+      id: 'msg-456',
+      withPreviousMessages: 1,
+      withNextMessages: 1,
+    },
+  ],
+})
+```
+
+With a positive `perPage`, included windows are combined with the paginated history and semantic results without duplicate messages. The returned message count can exceed `perPage`.
+
+Explicit includes are also honored when `threadConfig.lastMessages` is `false` or `0`. This doesn't enable ordinary history retrieval: without explicit or semantic includes, history stays disabled.
+
+When `resourceId` is supplied, included anchors and neighbors must belong to that resource. Includes can reference another thread in the same resource, but each context window stays within its anchor's thread.
+
 ## Signal visibility
 
 `hideSignals` filters messages returned by this call, not the underlying storage or later model requests. Ordinary messages remain available. This option isn't a security boundary and doesn't change signal delivery or persistence policies such as `ifActive`, `ifIdle`, or `transient`.

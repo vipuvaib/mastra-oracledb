@@ -166,7 +166,8 @@ const results = await store.query({
   {
     name: '$size',
     description: 'Array length check',
-    example: '{ tags: { $size: { $gt: 2 } } } — MongoDB requires an integer instead: { tags: { $size: 3 } }',
+    example:
+      '{ tags: { $size: { $gt: 2 } } } — MongoDB and OracleDB require a non-negative integer instead: { tags: { $size: 3 } }',
     supportedBy: ['Astra', 'libSQL', 'PgVector', 'MongoDB', 'OracleDB'],
   },
   {
@@ -269,11 +270,26 @@ const results = await store.query({
 
 ### OracleDB
 
-- Metadata is stored as Oracle JSON alongside each `VECTOR` row
-- Scalar comparisons use `JSON_VALUE`, while array, existence, and element-match checks use `JSON_EXISTS`
-- `$regex` uses Oracle `REGEXP_LIKE`; string `$contains` uses case-insensitive `LIKE`
-- Nested fields are supported with dot notation and are converted to quoted Oracle JSON paths
-- User-provided metadata values are bound as parameters instead of interpolated into SQL
+Metadata is stored as Oracle JSON alongside each `VECTOR` row. Filters use `JSON_VALUE`, `JSON_EXISTS`, `REGEXP_LIKE`, and `LIKE` with bound values. Nested fields support dot notation.
+
+Oracle-specific behavior includes:
+
+- **Numeric ranges:** `$gt`, `$gte`, `$lt`, and `$lte` with a number operand compare only stored JSON numbers. Numeric strings, booleans, arrays, objects, null, and missing fields are excluded, including under `$not`.
+- **Array membership:** A nonempty array operand for `$contains` requires a stored array containing every requested element. A string operand performs a case-insensitive scalar substring match or an exact array-element match.
+- **Array exclusion:** On stored arrays, `$nin` excludes arrays containing any listed element.
+- **Null equality:** `$eq: null` matches JSON null or a missing field. `$ne: null` requires the field to exist and contain a non-null value. Arrays, objects, and empty strings aren't treated as null.
+- **Array length:** `$size` requires a non-negative integer and matches only arrays. For example, `{ tags: { $size: 3 } }` matches arrays with exactly three elements. Comparison objects aren't supported.
+- **Regex:** `$regex` accepts a string or `RegExp` using Oracle regex syntax. String patterns can use `$options`, for example `{ title: { $regex: '^oracle', $options: 'im' } }`. Supported flags are `i`, `m`, and `s`, and matching is case-sensitive by default. Flags from a `RegExp` and `$options` are combined. Unsupported flags or `$options` without `$regex` throw an error.
+
+Empty array operands have distinct meanings:
+
+| Filter | Matches |
+| - | - |
+| `{ tags: { $all: [] } }` | No rows |
+| `{ tags: { $contains: [] } }` | Every row |
+| `{ tags: { $nin: [] } }` | Every row |
+
+These semantics also apply inside logical operators. For example, negating `$all: []` matches every row. The [Oracle vector store](/reference/vectors/oracledb#mutation-filter-safeguards) rejects unconditional match-all filters for destructive operations.
 
 ### PgVector
 
