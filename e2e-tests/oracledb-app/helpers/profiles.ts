@@ -35,7 +35,7 @@ const application = {
     'F03',
     'F04',
   ],
-  live: ['L01', 'L02'],
+  live: ['L01', 'L02', 'L03', 'L04'],
 } as const;
 export const acceptance = {
   ...application,

@@ -71,7 +71,8 @@ Build or repack Memory after source changes so the tests use the intended runtim
 | test:upgrade                    | Published Oracle adapter 0.3.0 to current adapter, using a fresh schema                  |
 | test:repeat                     | Three fresh-schema certification runs with unchanged source/build fingerprints           |
 | test:restart                    | Separate manual administrative helper; requires a separately verified disposable target  |
-| test:live                       | Two opt-in provider tests; refuses unset model/key settings                              |
+| test:live:preflight             | One paid OCI readiness request; no Oracle connection                                     |
+| test:live                       | Four opt-in live-provider cases; validates OCI IAM or API-key configuration              |
 | test:cleanup artifacts/<run-id> | Remove only the owned tables recorded by that run                                        |
 
 After the root setup, run from the harness directory:
@@ -96,18 +97,98 @@ base package and harness checks need no Oracle connection.
 
 ### Optional live provider
 
-Set these values in the private env file before running `pnpm test:live`:
+The live profile makes paid model requests and uses an exclusive empty Oracle
+schema. It has four mandatory cases:
+
+| ID  | Acceptance case                                                          |
+| --- | ------------------------------------------------------------------------ |
+| L01 | Real generation and exact persisted user/assistant content               |
+| L02 | Random-code recall from Oracle history after a replacement server starts |
+| L03 | Complete streamed response and one persisted assistant message           |
+| L04 | Real calculator invocation, arguments and persisted tool result          |
+
+The existing 33 application cases and 38-case certification remain deterministic.
+Live results are reported separately. No live case is converted to a skip when
+configuration or provider access fails.
+
+#### OCI Generative AI
+
+The fixture has a private AI SDK V2 bridge to the [official OCI TypeScript SDK](https://docs.oracle.com/en-us/iaas/tools/typescript/latest/classes/_generativeaiinference_lib_client_.generativeaiinferenceclient.html).
+It sends signed `GENERIC` chat requests in `ON_DEMAND` mode, including conversation
+history and function results. Streaming uses OCI server-sent events, rather than
+splitting a completed response into artificial chunks. It doesn't expose a
+published Mastra provider.
+
+Add these settings to the private database env file, or use a separate private
+file selected by `ORACLE_APP_LIVE_ENV`:
 
 ```dotenv
+ORACLE_APP_LIVE_PROVIDER=oci
+ORACLE_APP_LIVE_MODEL=oci/openai.gpt-oss-120b
+ORACLE_APP_OCI_CONFIG_FILE=/absolute/private/oci/config
+ORACLE_APP_OCI_PROFILE=DEFAULT
+ORACLE_APP_OCI_AUTH=session
+ORACLE_APP_OCI_ENDPOINT=https://inference.generativeai.us-chicago-1.oci.oraclecloud.com
+ORACLE_APP_OCI_COMPARTMENT_ID=<approved-compartment-or-tenancy-ocid>
+ORACLE_APP_OCI_MODEL_ID=<approved-Chicago-model-ocid>
+```
+
+Use the model OCID supplied by OCI Playground for the selected model and region.
+The compartment and authenticated identity must have access to that model.
+`session` uses `SessionAuthDetailProvider` and requires a valid
+`security_token_file` and its private signing key. Set
+`ORACLE_APP_OCI_AUTH=config` for an API signing-key profile through
+`ConfigFileAuthenticationDetailsProvider`. This authentication doesn't use a
+provider API-key environment variable. A profile path alone doesn't establish
+model authorization.
+
+Optional request settings are `ORACLE_APP_OCI_MAX_TOKENS` (default 2048, range
+1–4096), `ORACLE_APP_OCI_TEMPERATURE` (default 0, range 0–2) and
+`ORACLE_APP_OCI_TIMEOUT_MS` (default 60000, range 1000–120000).
+Temperature zero reduces variation but doesn't make a live model deterministic.
+Model and endpoint regions must match. Endpoint configuration accepts only the
+OCI inference HTTPS hostname, without custom paths or query strings.
+
+From the harness directory, check OCI connectivity without opening Oracle:
+
+```bash
+pnpm test:live:preflight
+```
+
+This sends one real readiness request and reports model identity and token usage.
+Then run the application profile:
+
+```bash
+pnpm test:live
+```
+
+The OCI live runner repeats the readiness request before claiming the database
+schema. Failed authorization or readiness leaves the schema unclaimed. A successful
+run then executes all four cases through MastraClient and real HTTP, with Oracle
+persistence and process restart. SDK retries are disabled; request cancellation
+and timeouts propagate. Keep API keys, signing keys and session tokens outside
+the repository and retained reports.
+
+The fixture registers an agent named `live` when `ORACLE_APP_PROFILE=live`.
+Its existing agents keep their scripted models. This bridge covers text,
+function tools and streaming. Multimodal input and structured JSON output are
+outside its supported scope. Embeddings remain deterministic; L01–L04 don't
+certify live embedding quality or semantic retrieval.
+
+#### Other API-key providers
+
+The existing provider/model path remains available:
+
+```dotenv
+ORACLE_APP_LIVE_PROVIDER=api-key
 ORACLE_APP_LIVE_MODEL=
 ORACLE_APP_LIVE_API_KEY_ENV=
 ```
 
 `ORACLE_APP_LIVE_MODEL` contains a provider/model identifier.
 `ORACLE_APP_LIVE_API_KEY_ENV` names the environment variable containing that
-provider's key; supply its value privately. No provider or model is selected by
-default. Empty settings fail before the profile claims the schema. The two cases
-check generation persistence and random-code recall after restart.
+provider's key; supply its value privately. No model is selected by default.
+Missing settings fail before the profile claims the schema.
 
 ### Manual CI workflow
 
@@ -386,6 +467,36 @@ still prevent strict package-consumer certification. The smaller
 [Oracle-only package check](../../stores/oracledb/PACKAGING.md#known-validation-limitation)
 uses a different import graph and also retains a failed strict result. Runtime
 success doesn't waive either type check.
+
+### OCI live integration status
+
+Validation on 2026-11-11 passed all 31 database-independent harness checks,
+including real SDK signing over loopback HTTP, both authentication modes, Mastra
+tool execution, streamed tool execution, UTF-8 decoding, cancellation and
+truncated-stream rejection. The OCI IAM configuration test also failed on the
+original helper's API-key requirement, as intended. The targeted frozen install,
+TypeScript checks, focused lint and formatting passed.
+
+The real OCI live profile passed **4/4 mandatory cases, zero failures, zero skips
+and zero todos**, using `openai.gpt-oss-120b` through the Chicago OCI endpoint,
+Oracle Database 26.1.0.24.0 and OCI SDK 2.146.0. Run
+`b1141aa9-2481-4b0e-948b-61d6f8857a0f` records every required ID exactly once.
+The returned model OCID matched the requested model. The fixture/source
+fingerprint stayed unchanged during execution; subsequent README edits only
+record these results. Run data, logs, results and the original table manifest
+remain available for inspection.
+
+Two setup failures were resolved before certification. An inference request to
+the tenancy root returned HTTP 404; selecting the approved child compartment
+resolved it with the existing API signing key. Database login initially returned
+ORA-01017; verifying the correct PDB and aligning the unused test account's
+credential, required privileges and quota resolved it. `ORACLE_APP_TEST_SCHEMA`
+matches the authenticated owner; it neither creates a database user nor changes
+the login credential.
+
+These results certify L01–L04 for the tested configuration. They don't turn the
+deterministic 38-case profile into a live-provider run, certify session-token
+authentication against the real service, or establish live embedding/RAG quality.
 
 ## Coverage limits
 

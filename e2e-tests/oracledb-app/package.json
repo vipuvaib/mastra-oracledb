@@ -19,7 +19,8 @@
     "test:delivery": "tsx helpers/delivery-check.ts",
     "test:upgrade": "tsx helpers/upgrade-check.ts",
     "test:restart": "tsx helpers/restart-check.ts",
-    "test:repeat": "tsx helpers/repeat-certification.ts"
+    "test:repeat": "tsx helpers/repeat-certification.ts",
+    "test:live:preflight": "tsx helpers/live-provider-preflight.ts"
   },
   "dependencies": {
     "@ai-sdk/provider-v5": "npm:@ai-sdk/provider@2.0.3",
@@ -31,6 +32,8 @@
     "@mastra/observability": "workspace:*",
     "@mastra/oracledb": "workspace:*",
     "hono": "^4.13.7",
+    "oci-common": "2.146.0",
+    "oci-generativeaiinference": "2.146.0",
     "zod": "catalog:"
   },
   "devDependencies": {

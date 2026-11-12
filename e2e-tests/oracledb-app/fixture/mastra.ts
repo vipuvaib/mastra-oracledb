@@ -10,6 +10,7 @@ import { environment } from '../helpers/environment.ts';
 import { liveEnvironment } from '../helpers/live-environment.ts';
 import { deterministicEmbedder } from './embeddings.ts';
 import { scriptedModel } from './models/scripted-model.ts';
+import { createLiveModel } from './models/live-model.ts';
 import { observationControls } from './observation-controls.ts';
 import { createObservedMemory } from './observed-memory.ts';
 import { retrievalTool } from './retrieval.ts';
@@ -112,8 +113,9 @@ export async function createFixture() {
         id: 'live',
         name: 'live',
         instructions: 'Follow the user instructions precisely.',
-        model: live.model,
+        model: await createLiveModel(live),
         memory,
+        tools: { calculator },
       })
     : undefined;
   const mastra = new Mastra({

@@ -6,6 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { captureTables } from './cleanup.ts';
 import { liveEnvironment } from './live-environment.ts';
+import { checkOciProvider } from './live-provider-preflight.ts';
 import { preflight } from './preflight.ts';
 import { acceptance, validateCoverage } from './profiles.ts';
 
@@ -15,10 +16,10 @@ const requestedMode = process.argv[2];
 if (!requestedMode || !Object.hasOwn(acceptance, requestedMode))
   throw new Error('Expected smoke, e2e, certification or live.');
 const mode = requestedMode as keyof typeof acceptance;
-if (mode === 'live') {
-  const live = liveEnvironment();
+const live = mode === 'live' ? liveEnvironment() : undefined;
+if (live) {
   process.env.ORACLE_APP_LIVE_MODEL = live.model;
-  process.env[live.apiKeyEnv] = live.apiKey;
+  if (live.provider === 'api-key') process.env[live.apiKeyEnv] = live.apiKey;
   process.env.ORACLE_APP_PROFILE = 'live';
 } else {
   process.env.ORACLE_APP_PROFILE = mode;
@@ -50,9 +51,20 @@ const packages = Object.fromEntries(
   ].map(name => [name, require(`${name}/package.json`).version]),
 );
 packages.oracledb = createRequire(require.resolve('@mastra/oracledb'))('oracledb/package.json').version;
+if (live?.provider === 'oci') {
+  packages['oci-common'] = require('oci-common/package.json').version;
+  packages['oci-generativeaiinference'] = require('oci-generativeaiinference/package.json').version;
+}
 const evidence = {
   runId,
   mode,
+  live: live
+    ? {
+        provider: live.provider,
+        model: live.model,
+        ...(live.provider === 'oci' ? { modelId: live.modelId, endpoint: live.endpoint, auth: live.auth } : {}),
+      }
+    : undefined,
   revision: git('rev-parse', 'HEAD').trim(),
   patchFingerprint: fingerprint.digest('hex'),
   node: process.version,
@@ -63,6 +75,10 @@ writeFileSync(join(artifacts, 'environment.json'), JSON.stringify(evidence, null
 console.log(`Evidence: ${artifacts}`);
 let claimed = false;
 try {
+  if (live?.provider === 'oci') {
+    const provider = await checkOciProvider(live);
+    writeFileSync(join(artifacts, 'provider-check.json'), JSON.stringify(provider, null, 2));
+  }
   const database = await preflight(runId);
   claimed = true;
   process.env.ORACLE_APP_RUN_ID = runId;
